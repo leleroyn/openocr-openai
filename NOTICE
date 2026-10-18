@@ -1,0 +1,11 @@
+openocr-openai
+Copyright 2026 openocr-openai contributors
+
+This product includes software developed at
+Topdu/OpenOCR (https://github.com/Topdu/OpenOCR), licensed under the Apache License 2.0.
+
+This product downloads the following model weights at first run; they are subject to
+their own licenses on ModelScope / Hugging Face:
+  - OpenDoc-0.1B (opendoc-0.1b)
+  - UniRec-0.1B  (unirec-0.1b)
+Check the model cards for the terms of use of the weights before public deployment.

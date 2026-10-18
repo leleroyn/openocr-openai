@@ -1,0 +1,23 @@
+# 服务端依赖（GPU 镜像见 Dockerfile：onnxruntime 会被替换成 onnxruntime-gpu==1.22.0）
+openocr-python==0.1.5
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pillow>=10
+requests>=2.31
+
+# 推理后端：CPU 用 onnxruntime；GPU 用 onnxruntime-gpu（Dockerfile 内已处理）
+onnxruntime>=1.18
+
+# GPU 模式需要的 CUDA 12 运行时库（CPU 环境可整段删掉）
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-curand-cu12
+nvidia-cufft-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+
+# 模型权重下载（openocr 内部走 modelscope）
+modelscope>=1.20
+
+# 仅 examples/openai_sdk_demo.py 需要，服务端不需要：pip install openai

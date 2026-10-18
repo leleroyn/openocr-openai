@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行时产物
+*.log
+logs/
+tmp/
+models/
+*.onnx
+
+# 测试用图片（本地样例，不入库）
+/*.png
+/*.jpg
+/*.jpeg
+/*.pdf
+
+# 本地私有运维笔记（含内网地址/服务器状态，不入库）
+/deploy.md
+/README-openocr.md
+/.env
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

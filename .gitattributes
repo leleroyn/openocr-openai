@@ -1,0 +1,12 @@
+# 统一按 LF 入库；shell 脚本与 Python 强制 LF（Windows 检出也不转 CRLF）
+* text=auto
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.txt  text eol=lf
+Dockerfile text eol=lf
+*.png  binary
+*.jpg  binary
+*.onnx binary
+*.tar  binary
