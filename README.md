@@ -8,7 +8,7 @@
 > 没有对话语义，不消耗 token 计费（`usage` 恒为 0）。
 
 <p>
-  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="Python" src="https://img.shields.io/badge/python-3.10-blue">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-REST-blue">
   <img alt="Docker" src="https://img.shields.io/badge/Docker-GPU%20%7C%20CPU-blue">
@@ -356,7 +356,7 @@ python test_repeat_guard.py             # 重复循环防护的单元测试，�
 │   └── curl.sh                # curl 调用示例
 ├── docs/
 │   └── DEPLOY.md              # 显存调优 / 发布流程 / 模型缓存细节
-├── LICENSE                    # Apache-2.0
+├── LICENSE                    # MIT（本项目）
 └── NOTICE
 ```
 
@@ -370,6 +370,13 @@ python test_repeat_guard.py             # 重复循环防护的单元测试，�
 
 ## 许可
 
-Apache License 2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+本项目（服务封装、脚本、文档）以 **MIT** 许可发布，见 [LICENSE](LICENSE)。
 
-本项目封装的 [OpenOCR](https://github.com/Topdu/OpenOCR) 及其模型权重遵循各自的许可条款。
+依赖与内含项遵循各自的许可条款，不在本项目的 MIT 许可范围内：
+
+- [OpenOCR](https://github.com/Topdu/OpenOCR)（`openocr-python`）：Apache License 2.0
+- OpenDoc-0.1B / UniRec-0.1B **模型权重**：首次运行自动下载，遵循模型卡上的许可条款，
+  公开部署前请自行核对
+- ONNX Runtime、FastAPI、PyTorch 等第三方依赖：见各自上游许可
+
+归属说明见 [NOTICE](NOTICE)。
