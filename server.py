@@ -9,6 +9,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -86,56 +87,89 @@ _ort.InferenceSession = _session
 #      一次生成几百步就是 GB 级 memcpy，长文本下这块能吃掉解码时间的两三成。
 # ---------------------------------------------------------------------------
 REPEAT_GUARD = os.environ.get("OPENOCR_REPEAT_GUARD", "true").lower() in ("1", "true", "yes")
-REPEAT_NGRAM = int(os.environ.get("OPENOCR_REPEAT_NGRAM", "8"))
-REPEAT_MIN_TIMES = int(os.environ.get("OPENOCR_REPEAT_MIN_TIMES", "3"))
-REPEAT_SINGLE = int(os.environ.get("OPENOCR_REPEAT_SINGLE", "16"))
+# 判定方式：找尾部的最小重复周期 p（1..REPEAT_NGRAM），要求「同一周期连续重复 >= REPEAT_MIN_REPS 次，
+# 且累计 token 数 >= 阈值」才算循环。用周期而不是固定 n-gram，才能抓到 <td>金额</td> 这种 3 token 周期的小循环。
+REPEAT_NGRAM = int(os.environ.get("OPENOCR_REPEAT_NGRAM", "8"))          # 检测的最大周期
+REPEAT_MIN_REPS = int(os.environ.get("OPENOCR_REPEAT_MIN_REPS", "3"))    # 至少完整重复几遍
+REPEAT_MIN_TOKENS = int(os.environ.get("OPENOCR_REPEAT_MIN_TOKENS", "32"))        # 正文：连续重复这么多 token 判定循环
+# 表格专用：<td></td>、|---|、|  | 这类纯结构 token 的重复是表格骨架本身，阈值放宽 3 倍
+# （96 token ≈ 48 个连续空单元格），否则空单元格多的表会被误截。
+REPEAT_STRUCT_MIN_TOKENS = int(os.environ.get("OPENOCR_REPEAT_STRUCT_MIN_TOKENS", "96"))
+# 输出层兜底（解码层早停之外的补漏），同样区分正文/表格骨架
+TRIM_MIN_TIMES = int(os.environ.get("OPENOCR_TRIM_MIN_TIMES", "8"))
+TRIM_STRUCT_MIN_TIMES = int(os.environ.get("OPENOCR_TRIM_STRUCT_MIN_TIMES", "24"))
+
+# 去掉 HTML 标签后只剩分隔符/空白/标点的片段 = 纯结构（表格骨架），不含任何文字
+_TAG_RE = re.compile(r"<[^>]*>")
+_CONTENT_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _is_structural(text: str) -> bool:
+    """这段文本是不是纯表格骨架（<td></td>、|---|、|  | 之类，没有任何实际文字/数字）。"""
+    stripped = _TAG_RE.sub("", text)
+    if not stripped.strip():
+        return True
+    return not _CONTENT_RE.search(stripped)
+
 
 _repeat_state = threading.local()   # 每个 worker 线程一次只跑一个生成（doc 任务多线程共享同一 session）
 
 
-def _is_repeating(seq) -> bool:
-    """seq 尾部是否已进入重复循环（n-gram 连续重复，或单 token 刷屏）。"""
-    n, k = REPEAT_NGRAM, REPEAT_MIN_TIMES
+def _count_tail_reps(seq, unit_len: int) -> int:
+    """尾部 unit_len 长度的片段连续重复了几次。"""
     L = len(seq)
-    if n > 1 and L >= n * k:
-        tail = seq[-n:]
-        reps = 1
-        for i in range(2, k + 1):
-            start = L - n * i
-            if seq[start:start + n] == tail:
-                reps += 1
-            else:
-                break
-        if reps >= k:
-            return True
-    if L >= REPEAT_SINGLE:
-        last = seq[-1]
-        reps = 1
-        for i in range(L - 2, -1, -1):
-            if seq[i] == last:
-                reps += 1
-            else:
-                break
-        if reps >= REPEAT_SINGLE:
-            return True
-    return False
+    if unit_len <= 0 or L < unit_len:
+        return 0
+    tail = seq[-unit_len:]
+    reps = 1
+    while L - unit_len * (reps + 1) >= 0 and seq[L - unit_len * (reps + 1):L - unit_len * reps] == tail:
+        reps += 1
+    return reps
+
+
+def _tail_period(seq):
+    """尾部最小重复周期及其重复次数：返回 (period, reps)，无重复时 (1, 1)。"""
+    for p in range(1, min(REPEAT_NGRAM, len(seq)) + 1):
+        reps = _count_tail_reps(seq, p)
+        if reps >= REPEAT_MIN_REPS:
+            return p, reps
+    return 1, 1
+
+
+def _is_repeating(seq, texts=None) -> bool:
+    """seq 尾部是否已进入重复循环。texts 是对应 token 的文本，用来区分表格骨架与正文。
+
+    表格输出天然高度周期化（每行结构一样），所以只看「重复得有多长」会误伤正常表格：
+    判定单位是连续重复的 token 总数，且纯结构（没有任何文字/数字）的重复阈值放宽 3 倍。
+    """
+    p, reps = _tail_period(seq)
+    if reps < REPEAT_MIN_REPS:
+        return False
+    unit_txt = "".join(texts[-p:]) if texts else ""
+    structural = bool(texts) and _is_structural(unit_txt)
+    need = REPEAT_STRUCT_MIN_TOKENS if structural else REPEAT_MIN_TOKENS
+    return p * reps >= need
 
 
 def _trim_repeats(text: str) -> str:
-    """输出层兜底：结尾被同一个子串刷屏时截断（解码层早停之外的补漏）。"""
+    """输出层兜底：结尾被同一个子串刷屏时截断（解码层早停之外的补漏）。
+
+    纯结构重复（表格骨架）阈值放宽到 TRIM_STRUCT_MIN_TIMES，避免误截空单元格多的表。
+    """
     n = len(text)
     if n < 24:
         return text
     for L in range(1, 25):
-        if n < L * 8:
-            break
         unit = text[-L:]
+        need = TRIM_STRUCT_MIN_TIMES if _is_structural(unit) else TRIM_MIN_TIMES
+        if n < L * need:
+            continue
         reps = 1
         i = n - L
         while i - L >= 0 and text[i - L:i] == unit:
             reps += 1
             i -= L
-        if reps >= 8:
+        if reps >= need:
             return text[:i + L].rstrip() + "…"
     return text
 
@@ -155,8 +189,14 @@ def _patch_unirec(cls) -> None:
         if hist is None or past_length == 0:
             hist = []
             _repeat_state.hist = hist
+            _repeat_state.texts = []
+            _repeat_state.steps = 0
             _repeat_state.stopped = False
-        hist.append(int(input_id))
+        tid = int(input_id)
+        hist.append(tid)
+        _repeat_state.steps = past_length + 1
+        id2tok = getattr(self.tokenizer, "id_to_token", None)
+        _repeat_state.texts.append(id2tok.get(tid, "") if isinstance(id2tok, dict) else "")
 
         f32 = _np.float32
         ck = cross_k if cross_k.dtype == f32 else cross_k.astype(f32)
@@ -167,22 +207,24 @@ def _patch_unirec(cls) -> None:
         logits, present = self._ocr_orig_decode_step(input_id, past_length, ck, cv, cache,
                                                      padding_idx=padding_idx)
 
-        if REPEAT_GUARD and len(hist) >= REPEAT_NGRAM * REPEAT_MIN_TIMES and _is_repeating(hist):
+        if REPEAT_GUARD and len(hist) >= REPEAT_MIN_TOKENS \
+                and _is_repeating(hist, _repeat_state.texts):
             eos = int(getattr(self.tokenizer, "eos_token_id", 2))
             row = logits[0, -1]
             if 0 <= eos < row.shape[0]:
                 row[:] = -1e30
                 row[eos] = 1.0
                 _repeat_state.stopped = True
-                log.warning("检测到重复输出，已在第 %d 步强制结束（token 数 %d，n-gram=%d×%d）",
-                            past_length + 1, len(hist), REPEAT_NGRAM, REPEAT_MIN_TIMES)
+                log.warning("检测到重复输出，已在第 %d 步强制结束（连续重复 %d token，周期 %d，正文阈值 %d / 表格骨架阈值 %d）",
+                            past_length + 1, len(hist), _tail_period(hist)[0],
+                            REPEAT_MIN_TOKENS, REPEAT_STRUCT_MIN_TOKENS)
         return logits, present
 
     decode_step._ocr_patched = True
     cls._ocr_orig_decode_step = cls.decode_step
     cls.decode_step = decode_step
-    log.info("UniRec 解码补丁已生效：重复循环早停 n-gram=%d×%d，单 token=%d",
-             REPEAT_NGRAM, REPEAT_MIN_TIMES, REPEAT_SINGLE)
+    log.info("UniRec 解码补丁已生效：重复循环早停 周期<=%d 且连续重复>=%d token（表格骨架 %d token）",
+             REPEAT_NGRAM, REPEAT_MIN_TOKENS, REPEAT_STRUCT_MIN_TOKENS)
 
 
 # 前置缩放压显存（不改 openocr 任何配置）。
@@ -372,10 +414,18 @@ def _run_opendoc(engine, img_path: str) -> str:
 
 def _run_unirec(engine, img_path: str, max_tokens: int) -> str:
     _repeat_state.stopped = False
+    _repeat_state.steps = 0
     text, _ = engine(image_path=img_path, max_length=max_tokens)
+    text = _trim_repeats(text)
     if getattr(_repeat_state, "stopped", False):
         log.warning("unirec 输出被重复防护截断: %s", os.path.basename(img_path))
-    return _trim_repeats(text)
+    # 跑满 token 预算说明是被长度切断的，不是模型自然收尾 —— 表格/长文档最常见，
+    # 静默截断会让调用方拿到半张表，所以显式标记出来。
+    if getattr(_repeat_state, "steps", 0) >= max_tokens - 1:
+        log.warning("unirec 输出达到 max_tokens=%d 上限，已标记截断: %s", max_tokens, os.path.basename(img_path))
+        text += (f"\n\n> ⚠️ 输出达到 max_tokens={max_tokens} 上限，内容被截断。"
+                 f"表格/长文档请把大图按行块切分后分多次请求（服务端上限 {MAX_TOKENS_CAP}）。")
+    return text
 
 
 def _notice(model: str) -> str:
@@ -438,7 +488,8 @@ def health():
             "max_image_kb": MAX_IMAGE_BYTES // 1024,
             "max_parallel_blocks": MAX_PARALLEL_BLOCKS,
             "repeat_guard": REPEAT_GUARD,
-            "repeat_ngram": f"{REPEAT_NGRAM}x{REPEAT_MIN_TIMES}",
+            "repeat_min_tokens": REPEAT_MIN_TOKENS,
+            "repeat_struct_min_tokens": REPEAT_STRUCT_MIN_TOKENS,
             "url_timeout_s": URL_TIMEOUT, "max_url_mb": MAX_URL_BYTES // (1024 * 1024),
             "max_body_mb": MAX_BODY_BYTES // (1024 * 1024)}
 
