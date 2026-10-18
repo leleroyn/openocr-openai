@@ -7,20 +7,39 @@
 """
 import base64
 import json
+import logging
 import os
+import sys
 import tempfile
-import time
-import uuid
 import threading
+import time
+import urllib.request
+import uuid
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import numpy as _np
 import onnxruntime as _ort
 
+log = logging.getLogger("openocr-openai")
+if not log.handlers:            # uvicorn 只配置自己的 logger，我们的 INFO 日志默认会被丢掉
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [openocr-openai] %(message)s"))
+    log.addHandler(_h)
+log.setLevel(os.environ.get("OPENOCR_LOG_LEVEL", "INFO").upper())
+
 os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+# openocr 的推理日志里有 emoji（🔧 ✅），Windows 下 stdout 被重定向到文件/服务时默认 GBK，
+# 一个 emoji 就能让进程 UnicodeEncodeError 直接退出。统一按 UTF-8 输出，编码不了的字符替换掉。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 _orig_session = _ort.InferenceSession
 
@@ -51,12 +70,132 @@ def _session(path_or_bytes, sess_options=None, providers=None, provider_options=
 
 _ort.InferenceSession = _session
 
+# ---------------------------------------------------------------------------
+# UniRec 解码层补丁：重复循环早停 + 去掉每步的张量拷贝
+#
+# 库原版解码循环（openocr/tools/infer_unirec_onnx.py 的 _infer_single_image）是纯贪心 argmax，
+# 出口只有 EOS 一个判断，没有任何重复检测；上游后处理也只有 `_{4,}`→`___`、`\.{4,}`→`...` 两条正则，
+# 治不了 token 级循环。模型一旦陷入循环（空白块、密集小字、超宽长条最容易触发），
+# 会一路跑满 max_length 步（默认 2048），单张图白烧几十秒，还全程占着服务端的串行锁，
+# 整个服务被一个请求拖死。
+#
+# 这里在运行时给 UniRecONNX.decode_step 打补丁（不改 site-packages，升级 openocr 后签名不匹配就自动跳过）：
+#   1) 尾部 n-gram 连续重复 k 次 → 把该步 logits 的 argmax 改成 EOS，让库的循环自然 break；
+#   2) 原版每步都对 cross_k/cross_v（整页 encoder 的 KV）和每层 past_key/past_value 无条件
+#      .astype(np.float32)，dtype 本来就是 float32 也照拷。整页 1024px 时 cross KV 有几十 MB，
+#      一次生成几百步就是 GB 级 memcpy，长文本下这块能吃掉解码时间的两三成。
+# ---------------------------------------------------------------------------
+REPEAT_GUARD = os.environ.get("OPENOCR_REPEAT_GUARD", "true").lower() in ("1", "true", "yes")
+REPEAT_NGRAM = int(os.environ.get("OPENOCR_REPEAT_NGRAM", "8"))
+REPEAT_MIN_TIMES = int(os.environ.get("OPENOCR_REPEAT_MIN_TIMES", "3"))
+REPEAT_SINGLE = int(os.environ.get("OPENOCR_REPEAT_SINGLE", "16"))
+
+_repeat_state = threading.local()   # 每个 worker 线程一次只跑一个生成（doc 任务多线程共享同一 session）
+
+
+def _is_repeating(seq) -> bool:
+    """seq 尾部是否已进入重复循环（n-gram 连续重复，或单 token 刷屏）。"""
+    n, k = REPEAT_NGRAM, REPEAT_MIN_TIMES
+    L = len(seq)
+    if n > 1 and L >= n * k:
+        tail = seq[-n:]
+        reps = 1
+        for i in range(2, k + 1):
+            start = L - n * i
+            if seq[start:start + n] == tail:
+                reps += 1
+            else:
+                break
+        if reps >= k:
+            return True
+    if L >= REPEAT_SINGLE:
+        last = seq[-1]
+        reps = 1
+        for i in range(L - 2, -1, -1):
+            if seq[i] == last:
+                reps += 1
+            else:
+                break
+        if reps >= REPEAT_SINGLE:
+            return True
+    return False
+
+
+def _trim_repeats(text: str) -> str:
+    """输出层兜底：结尾被同一个子串刷屏时截断（解码层早停之外的补漏）。"""
+    n = len(text)
+    if n < 24:
+        return text
+    for L in range(1, 25):
+        if n < L * 8:
+            break
+        unit = text[-L:]
+        reps = 1
+        i = n - L
+        while i - L >= 0 and text[i - L:i] == unit:
+            reps += 1
+            i -= L
+        if reps >= 8:
+            return text[:i + L].rstrip() + "…"
+    return text
+
+
+def _patch_unirec(cls) -> None:
+    """给 UniRecONNX 类打补丁（doc 任务的 vlm_recognizer 也是这个类，一处覆盖两个引擎）。"""
+    if not hasattr(cls, "decode_step") or getattr(cls.decode_step, "_ocr_patched", False):
+        return
+    import inspect
+    params = list(inspect.signature(cls.decode_step).parameters)
+    if params[:6] != ["self", "input_id", "past_length", "cross_k", "cross_v", "past_key_values"]:
+        log.warning("UniRecONNX.decode_step 签名已变，跳过解码补丁（重复循环防护与拷贝优化不生效）")
+        return
+
+    def decode_step(self, input_id, past_length, cross_k, cross_v, past_key_values, padding_idx=1):
+        hist = getattr(_repeat_state, "hist", None)
+        if hist is None or past_length == 0:
+            hist = []
+            _repeat_state.hist = hist
+            _repeat_state.stopped = False
+        hist.append(int(input_id))
+
+        f32 = _np.float32
+        ck = cross_k if cross_k.dtype == f32 else cross_k.astype(f32)
+        cv = cross_v if cross_v.dtype == f32 else cross_v.astype(f32)
+        cache = [(k, v) if k.dtype == f32 and v.dtype == f32
+                 else (k.astype(f32), v.astype(f32)) for k, v in past_key_values]
+
+        logits, present = self._ocr_orig_decode_step(input_id, past_length, ck, cv, cache,
+                                                     padding_idx=padding_idx)
+
+        if REPEAT_GUARD and len(hist) >= REPEAT_NGRAM * REPEAT_MIN_TIMES and _is_repeating(hist):
+            eos = int(getattr(self.tokenizer, "eos_token_id", 2))
+            row = logits[0, -1]
+            if 0 <= eos < row.shape[0]:
+                row[:] = -1e30
+                row[eos] = 1.0
+                _repeat_state.stopped = True
+                log.warning("检测到重复输出，已在第 %d 步强制结束（token 数 %d，n-gram=%d×%d）",
+                            past_length + 1, len(hist), REPEAT_NGRAM, REPEAT_MIN_TIMES)
+        return logits, present
+
+    decode_step._ocr_patched = True
+    cls._ocr_orig_decode_step = cls.decode_step
+    cls.decode_step = decode_step
+    log.info("UniRec 解码补丁已生效：重复循环早停 n-gram=%d×%d，单 token=%d",
+             REPEAT_NGRAM, REPEAT_MIN_TIMES, REPEAT_SINGLE)
+
+
 # 前置缩放压显存（不改 openocr 任何配置）。
 # UniRec 的 SimpleImageProcessor 只做"超过 max_side(960x1408) 才缩小"，输入小于该尺寸时原样使用。
 # encoder 自注意力显存随 token 数增长，所以在进模型前把最长边压到 MAX_PIXEL_SIDE，模型侧参数一个都不动。
 MAX_PIXEL_SIDE = int(os.environ.get("OPENOCR_MAX_PIXEL_SIDE", "1024"))
 # 单图体积上限（base64 解码后的原始字节），超过则重编码 JPEG。
 MAX_IMAGE_BYTES = int(os.environ.get("OPENOCR_MAX_IMAGE_KB", "5120")) * 1024
+# 远端图片：下载超时与体积上限（无上限时一张 500MB 的图能把内存打满）
+URL_TIMEOUT = int(os.environ.get("OPENOCR_URL_TIMEOUT", "30"))
+MAX_URL_BYTES = int(os.environ.get("OPENOCR_MAX_URL_MB", "20")) * 1024 * 1024
+# 请求体上限（base64 膨胀 4/3，64MB 请求体约等于 48MB 图片）
+MAX_BODY_BYTES = int(os.environ.get("OPENOCR_MAX_BODY_MB", "64")) * 1024 * 1024
 
 
 def _shrink(path: str) -> str:
@@ -92,24 +231,37 @@ def _shrink(path: str) -> str:
 
 
 _engines: dict = {}
+_engine_lock = threading.Lock()   # 防止并发首次请求把同一个模型加载两遍（内存翻倍）
 GPU = os.environ.get("OPENOCR_USE_GPU", "false").lower() in ("1", "true", "yes", "auto")
-if GPU is False:
-    GPU = False
-_lock = threading.Lock()  # 单实例串行推理，防止显存/内存爆掉
+_lock = threading.Lock()          # 单实例串行推理，防止显存/内存爆掉
+# doc 任务内部按版面块并行识别（共享同一个 ONNX 会话，ORT 会话线程安全）。
+# CPU 下并行是真提速（session.run 会释放 GIL）；GPU 下并行几乎不涨吞吐，
+# 只会抬高解码峰值显存，所以默认 CPU=4、GPU=1。
+MAX_PARALLEL_BLOCKS = int(os.environ.get(
+    "OPENOCR_MAX_PARALLEL_BLOCKS", "1" if GPU else "4"))
 
 
 def get_engine(model: str):
     if model in _engines:
         return _engines[model]
-    from openocr import OpenOCR
-    if model == "opendoc-0.1b":
-        eng = OpenOCR(task="doc", use_layout_detection=True, use_gpu=GPU)
-    elif model == "unirec-0.1b":
-        eng = OpenOCR(task="unirec", use_gpu=GPU)
-    else:
-        raise KeyError(model)
-    _engines[model] = eng
-    return eng
+    with _engine_lock:
+        if model in _engines:
+            return _engines[model]
+        from openocr import OpenOCR
+        if model == "opendoc-0.1b":
+            eng = OpenOCR(task="doc", use_layout_detection=True, use_gpu=GPU,
+                          max_parallel_blocks=MAX_PARALLEL_BLOCKS)
+        elif model == "unirec-0.1b":
+            eng = OpenOCR(task="unirec", use_gpu=GPU)
+        else:
+            raise KeyError(model)
+        # doc 引擎的识别器是引擎内部的 vlm_recognizer，unirec 引擎本身就是 UniRecONNX
+        rec = getattr(getattr(eng, "model", None), "vlm_recognizer", None) \
+            if model == "opendoc-0.1b" else getattr(eng, "model", None)
+        if rec is not None:
+            _patch_unirec(type(rec))
+        _engines[model] = eng
+        return eng
 
 
 def _warmup():
@@ -123,7 +275,16 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="OpenOCR OpenAI-compatible API", version="1.1", lifespan=lifespan)
+app = FastAPI(title="OpenOCR OpenAI-compatible API", version="1.2", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _body_limit(request: Request, call_next):
+    """请求体上限：base64 图片直接进 JSON body，不设上限时一个大请求就能把内存打满。"""
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        return _err(413, f"请求体 {cl} 字节，超过上限 {MAX_BODY_BYTES // (1024 * 1024)}MB")
+    return await call_next(request)
 
 
 class ContentPart(BaseModel):
@@ -149,9 +310,27 @@ def _err(status: int, message: str, etype: str = "invalid_request_error") -> JSO
                         content={"error": {"message": message, "type": etype}})
 
 
+def _fetch_url(url: str, suffix: str) -> str:
+    """下载远端图片：带超时与体积上限。原版 urlretrieve 无超时，URL 卡住会永久占住 worker 线程。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "openocr-openai/1.2"})
+    p = os.path.join(tempfile.gettempdir(), f"oocr_{uuid.uuid4().hex}{suffix}")
+    total = 0
+    with urllib.request.urlopen(req, timeout=URL_TIMEOUT) as resp, open(p, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_URL_BYTES:
+                raise ValueError(f"远端图片超过 {MAX_URL_BYTES // (1024 * 1024)}MB 上限")
+            f.write(chunk)
+    if total == 0:
+        raise ValueError("远端图片为空")
+    return p
+
+
 def _extract_images(messages: list[ChatMessage]) -> list[str]:
     """从 messages 中提取所有图片(data URI 或 http url)，返回临时文件路径列表。"""
-    import urllib.request
     paths: list[str] = []
     for m in messages:
         if not isinstance(m.content, list):
@@ -170,9 +349,7 @@ def _extract_images(messages: list[ChatMessage]) -> list[str]:
                 paths.append(p)
             elif url.startswith(("http://", "https://")):
                 suffix = os.path.splitext(url.split("?")[0])[1] or ".png"
-                p = os.path.join(tempfile.gettempdir(), f"oocr_{uuid.uuid4().hex}{suffix}")
-                urllib.request.urlretrieve(url, p)
-                paths.append(p)
+                paths.append(_fetch_url(url, suffix))
             else:
                 raise ValueError(f"不支持的 image_url: {url[:80]}")
     return paths
@@ -194,8 +371,11 @@ def _run_opendoc(engine, img_path: str) -> str:
 
 
 def _run_unirec(engine, img_path: str, max_tokens: int) -> str:
+    _repeat_state.stopped = False
     text, _ = engine(image_path=img_path, max_length=max_tokens)
-    return text
+    if getattr(_repeat_state, "stopped", False):
+        log.warning("unirec 输出被重复防护截断: %s", os.path.basename(img_path))
+    return _trim_repeats(text)
 
 
 def _notice(model: str) -> str:
@@ -255,7 +435,12 @@ def _answer(model: str, content: str, stream: bool):
 def health():
     return {"status": "ok", "models": MODELS, "loaded": sorted(_engines),
             "gpu": GPU, "max_pixel_side": MAX_PIXEL_SIDE,
-            "max_image_kb": MAX_IMAGE_BYTES // 1024}
+            "max_image_kb": MAX_IMAGE_BYTES // 1024,
+            "max_parallel_blocks": MAX_PARALLEL_BLOCKS,
+            "repeat_guard": REPEAT_GUARD,
+            "repeat_ngram": f"{REPEAT_NGRAM}x{REPEAT_MIN_TIMES}",
+            "url_timeout_s": URL_TIMEOUT, "max_url_mb": MAX_URL_BYTES // (1024 * 1024),
+            "max_body_mb": MAX_BODY_BYTES // (1024 * 1024)}
 
 
 @app.get("/v1/models")
@@ -284,6 +469,7 @@ def chat_completions(req: ChatCompletionRequest):
     images = [_shrink(p) for p in images]
     engine = get_engine(req.model)
     contents = []
+    t0 = time.time()
     try:
         with _lock:
             for i, p in enumerate(images):
@@ -295,6 +481,7 @@ def chat_completions(req: ChatCompletionRequest):
                 header = f"### 图片 {i + 1}/{len(images)}: {name}\n\n" if len(images) > 1 else ""
                 contents.append(header + text.strip())
     except Exception as e:
+        log.exception("推理失败")
         return _err(500, f"推理失败: {e}", "server_error")
     finally:
         for p in images:
@@ -303,6 +490,8 @@ def chat_completions(req: ChatCompletionRequest):
             except OSError:
                 pass
 
+    log.info("%s | %d 图 | %.1fs | %d 字", req.model, len(images), time.time() - t0,
+             sum(len(c) for c in contents))
     return _answer(req.model, "\n\n---\n\n".join(contents), req.stream)
 
 

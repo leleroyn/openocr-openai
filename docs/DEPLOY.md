@@ -106,6 +106,41 @@ UniRec 的 `SimpleImageProcessor` 只做"超过 960×1408 才缩小"，输入小
 - 前置缩放（见上）。
 - 单锁串行推理，防止并发把显存/内存打爆。
 
+## 解码层补丁（重复循环 + 拷贝优化）
+
+`server.py` 在运行时给 `UniRecONNX.decode_step` 打补丁，两件事：
+
+1. **重复循环早停**：尾部 n-gram 连续重复（默认 8×3）或单 token 刷屏（默认 16 次）→ 该步 logits 的
+   argmax 强制成 EOS，库的贪心循环自然 break。库原版只有 EOS 一个出口，一旦循环会跑满
+   `max_length`（2048 步），单请求分钟级，且全程占着服务端串行锁，整台机器停摆。
+2. **省掉每步的张量拷贝**：原版每步对整页 encoder 的 `cross_k/cross_v` 和每层 `past_key/past_value`
+   无条件 `.astype(np.float32)`（dtype 已是 float32 也照拷）。整页 1024px 时 cross KV 几十 MB，
+   一次生成几百步 = GB 级 memcpy。补丁按 dtype 判断后复用数组。
+
+运维要点：
+
+- 启动日志确认：`UniRec 解码补丁已生效：重复循环早停 n-gram=8×3，单 token=16`。
+  出现 `UniRecONNX.decode_step 签名已变，跳过解码补丁` 的 WARNING 说明 openocr 升级后签名不匹配，
+  此时防护与拷贝优化都不生效，需要按新版源码改 `_patch_unirec`。
+- 触发防护时日志：`检测到重复输出，已在第 24 步强制结束`。大量出现说明输入质量差（空白块/超宽长条），
+  考虑调小 `OPENOCR_MAX_PIXEL_SIDE` 或让调用方裁掉空白。
+- 大表格页被误截 → 调大 `OPENOCR_REPEAT_NGRAM` / `OPENOCR_REPEAT_MIN_TIMES`；
+  彻底关闭 → `OPENOCR_REPEAT_GUARD=false`。
+- 补丁是**类级**的：unirec 引擎和 opendoc 内部的 `vlm_recognizer` 是同一个类，一处覆盖两个引擎。
+  状态存在 `threading.local()` 里，因为 doc 任务多线程共享同一个 ONNX 会话。
+- 版本耦合：`openocr-python==0.1.5`。升级前先在测试机跑 `python test_repeat_guard.py` + 真实图片对比。
+
+## 版面块并行
+
+opendoc 内部按版面块并行识别（`_parallel_vlm_recognize`，共享同一个 ONNX 会话，ORT 会话线程安全）：
+
+| 环境 | `OPENOCR_MAX_PARALLEL_BLOCKS` | 原因 |
+|---|---|---|
+| CPU | `4`（默认） | `session.run` 释放 GIL，并行是真提速 |
+| GPU | `1` | 并行几乎不涨吞吐，只抬高解码峰值显存 |
+
+注意每个 worker 会多占一份解码工作内存，CPU 机器内存紧张时降到 2。
+
 ## 网关接入排障
 
 | 现象 | 原因 / 处理 |
@@ -115,12 +150,18 @@ UniRec 的 `SimpleImageProcessor` 只做"超过 960×1408 才缩小"，输入小
 | 流式无输出 | 确认 `stream=true`，SSE 结尾必须有 `data: [DONE]`；推理是同步完成后分块下发（512 字/块） |
 | 网关超时 | 渠道超时设 >= 120s；CPU 模式 3 图 10~40s，机器被挤占时更慢 |
 | GPU 模式 opendoc 结果缺内容块，HTTP 仍 200 | 显存贴边导致静默丢块。查 `docker logs openocr-openai 2>&1 | grep -c "Error processing block"`，降 `--max-pixel-side` 或回退 CPU |
+| 单个请求卡住几十秒到几分钟 | 十有八九是模型陷入重复循环跑满 2048 步。确认启动日志里补丁已生效；防护生效时最坏也就 24 步 |
+| 远端图片 URL 卡住 | 已加 `OPENOCR_URL_TIMEOUT`（默认 30s）与 `OPENOCR_MAX_URL_MB`（默认 20MB）；库原版 `urlretrieve` 无超时，会把 worker 线程永久占住 |
+| 大请求把内存打满 | `OPENOCR_MAX_BODY_MB`（默认 64MB）超限返回 413 |
 | 计费异常 | `usage` 恒为 0，网关计费为 0；服务端不校验密钥，渠道 key 填任意值 |
 
 自检：`python3 test_newapi.py <图片>`，8 项全 200（流式项 `[DONE]OK`）即接入正常。
 
 ## 版本要点
 
+- **1.2（本仓库）**：解码层补丁（重复循环早停 + 去掉每步 astype 拷贝）、`max_parallel_blocks` 按 GPU/CPU 定默认、
+  远端图片下载超时与体积上限、请求体上限、`_shrink` 之外全链路耗时日志、Windows 下 stdout 强制 UTF-8
+  （openocr 日志带 emoji，GBK 环境会 `UnicodeEncodeError` 直接退出）。
 - **1.8**：接入网关的兼容性修复 —— 无图片请求返回 200 说明文本（之前 400 会让渠道测试失败）；
   支持 `stream=true` 标准 SSE；`max_tokens` 自动夹到 `[1, 2048]`（避免 `max_length=0` 让 unirec 报错）。
   只影响无图片与流式两条路径，推理逻辑未变。

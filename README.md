@@ -24,6 +24,7 @@
 - [接入 new-api / one-api 网关](#接入-newapi--oneapi-网关)
 - [配置项](#配置项)
 - [性能与显存](#性能与显存)
+- [循环输出防护](#循环输出防护)
 - [自检脚本](#自检脚本)
 - [项目结构](#项目结构)
 - [限制与注意事项](#限制与注意事项)
@@ -37,6 +38,8 @@
 - **单请求多图**：多图按顺序逐张识别，结果按 `### 图片 i/N` 分段拼接。
 - **前置缩放压显存**：进模型前把最长边压到上限并重编码 JPEG，**不改 OpenOCR / ONNX 任何配置**，显存随边长四次方下降。
 - **GPU / CPU 一键切换**：`OPENOCR_USE_GPU=true` 走 CUDA，显存不够时一条命令回退 CPU。
+- **重复循环早停**：UniRec 是纯贪心解码，库原版只有 EOS 一个出口，一旦陷入循环会跑满 2048 步；服务端在解码层加了 n-gram 重复检测，第 24 步就能切断（见[循环输出防护](#循环输出防护)）。
+- **资源上限齐全**：请求体、远端图片体积、下载超时、并发块数全部可配，不会被一个大请求拖死。
 - **单锁串行推理**：并发请求排队，避免显存/内存被打爆。
 - **零依赖客户端**：curl / Python / Java / Node 任何能发 HTTP POST JSON 的语言都能用。
 
@@ -207,7 +210,16 @@ String body = "{\"model\":\"opendoc-0.1b\",\"messages\":[{\"role\":\"user\",\"co
 | `OPENOCR_USE_GPU` | `false` | `true`/`1`/`yes`/`auto` = CUDA GPU；`false` = CPU |
 | `OPENOCR_MAX_PIXEL_SIDE` | `1024` | 进模型前的最长边上限，超过就等比缩小并重编码 JPEG。**越小越省显存**，密集小字会掉精度 |
 | `OPENOCR_MAX_IMAGE_KB` | `5120` | 单图字节上限（5MB），超过重编码 JPEG 直到达标（质量下限 55） |
+| `OPENOCR_MAX_PARALLEL_BLOCKS` | CPU `4` / GPU `1` | opendoc 版面块并行识别数（共享同一 ONNX 会话）。CPU 下并行真提速，GPU 下只抬峰值显存 |
+| `OPENOCR_REPEAT_GUARD` | `true` | 重复循环早停开关，`false` 关闭（回到库的原始行为） |
+| `OPENOCR_REPEAT_NGRAM` | `8` | 重复检测的 n-gram 长度 |
+| `OPENOCR_REPEAT_MIN_TIMES` | `3` | 同一 n-gram 连续出现几次判定为循环 |
+| `OPENOCR_REPEAT_SINGLE` | `16` | 同一个 token 连续出现几次判定为循环 |
+| `OPENOCR_URL_TIMEOUT` | `30` | 远端图片下载超时（秒） |
+| `OPENOCR_MAX_URL_MB` | `20` | 远端图片体积上限 |
+| `OPENOCR_MAX_BODY_MB` | `64` | 请求体上限（超出返回 413） |
 | `OMP_NUM_THREADS` | `4` | CPU 推理线程数 |
+| `OPENOCR_LOG_LEVEL` | `INFO` | 服务端日志级别（INFO 会打每个请求的耗时/字数） |
 | `PORT` | `8089` | `python server.py` 的监听端口 |
 
 挂载：`-v <本地目录>:/root/.cache/openocr` = 模型缓存（约 1GB，首次自动下载，建议持久化）。
@@ -223,7 +235,15 @@ CPU 模式（24 核，`max_pixel_side=1024`）实测：
 | 整页 A4（opendoc，含版面检测） | ~3s/页 |
 | 双图请求 | 6~10s |
 
-请求内部**串行**（单锁），并发请求排队，客户端超时建议 ≥ 60s/页。
+请求内部**串行**（单锁），并发请求排队，客户端超时建议 ≥ 60s/页。实测排队行为（本机 CPU，单图 unirec）：
+
+| 并发 | 墙钟 | 单请求延迟 min/med/max |
+|---|---|---|
+| 1 | 0.6s | 0.61 / 0.61 / 0.61s |
+| 3 | 2.5s | 0.92 / 1.68 / 2.33s |
+| 6 | 5.5s | 0.79 / 3.78 / 5.20s |
+
+吞吐基本恒定（约 1.1 张/秒），并发只增加排队延迟 —— 要提吞吐就加实例，不要改锁。
 
 GPU 显存构成（fp32，模型权重只有 933MB，稳态 3550 MiB）：
 
@@ -239,6 +259,37 @@ GPU 显存构成（fp32，模型权重只有 933MB，稳态 3550 MiB）：
 
 显存调优、发布流程、模型缓存目录细节见 `docs/DEPLOY.md`。
 
+## 循环输出防护
+
+自回归 OCR 模型（UniRec 是 encoder-decoder 贪心解码）有个通病：**一旦陷入重复循环就停不下来**。
+空白块、密集小字、超宽长条最容易触发，表现为输出里同一段文字/表格标签反复刷屏。
+
+库原版（`openocr/tools/infer_unirec_onnx.py` 的解码循环）对此**没有任何防护**：
+
+- 纯 `argmax` 贪心，出口只有 `next_token == eos` 一个判断；
+- 后处理只有 `_{4,}`→`___`、`\.{4,}`→`...` 两条正则，治不了 token 级循环；
+- 后果不只是输出脏：循环会一路跑满 `max_length`（默认 2048）步，单张图白烧几十秒，
+  而服务端是单锁串行，**一个循环请求能把整个服务拖死**。
+
+本项目在运行时给 `UniRecONNX.decode_step` 打补丁（不改 `site-packages`），加两道保险：
+
+1. **解码层早停**：尾部 n-gram（默认 8 token）连续重复 3 次，或同一个 token 连续出现 16 次，
+   就把该步 logits 的 argmax 改成 EOS，让库的循环自然 `break`。
+   实测死循环在第 **24** 步被切断（原本跑满 2047 步），单请求最坏耗时从分钟级回到秒级。
+2. **输出层兜底**：结尾被同一子串刷屏（连续 ≥ 8 次）时截断并加 `…`，覆盖自然收尾的轻度循环。
+
+顺带修掉一个真性能坑：原版每步都对整页 encoder 的 `cross_k/cross_v` 和每层 `past_key/value`
+无条件 `.astype(np.float32)`（dtype 本来就是 float32 也照拷），一次生成几百步就是 GB 级 memcpy；
+补丁里按 dtype 判断后直接复用，长文本解码明显变快。
+
+调参：
+
+- 大表格/公式页被误截（正常内容里出现长段完全重复的 token）→ 调大 `OPENOCR_REPEAT_NGRAM`/`OPENOCR_REPEAT_MIN_TIMES`
+- 想彻底回到库的原始行为 → `OPENOCR_REPEAT_GUARD=false`
+- 补丁带签名校验：升级 `openocr-python` 后 `decode_step` 签名变了就自动跳过并打 WARNING，不会瞎打
+
+`/health` 会回报当前防护参数（`repeat_guard`、`repeat_ngram`），部署后扫一眼即可确认生效。
+
 ## 自检脚本
 
 ```bash
@@ -250,6 +301,13 @@ python test_newapi.py page.png              # 网关接入自检 8 项：纯文�
 
 `test_newapi.py` 8 项全部 HTTP 200（流式项要求 `[DONE]OK`）即接入正常。
 
+```bash
+python test_repeat_guard.py             # 重复循环防护的单元测试，纯 Python、不需要模型、秒级
+```
+
+覆盖：n-gram 触发/不触发（正常文本、只重复 2 次、重复被隔开都不能触发）、输出层截断、
+模拟解码循环被提前切断、正常输出不被误伤。
+
 ## 项目结构
 
 ```
@@ -260,6 +318,7 @@ python test_newapi.py page.png              # 网关接入自检 8 项：纯文�
 ├── deploy-openocr.sh          # 服务器端容器发布脚本（重建 + 健康检查轮询）
 ├── test_api.py                # 接口冒烟测试
 ├── test_newapi.py             # 网关接入自检（8 项）
+├── test_repeat_guard.py       # 重复循环防护单元测试（不需要模型）
 ├── examples/
 │   ├── openai_sdk_demo.py     # 官方 openai SDK 调用示例
 │   └── curl.sh                # curl 调用示例
