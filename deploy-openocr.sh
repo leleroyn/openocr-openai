@@ -70,6 +70,14 @@ if [ "$DRY" = "1" ]; then
   exit 0
 fi
 
+# 先确认镜像在本机存在，再删旧容器。
+# 2026-10-19 踩过：--image 指定了不存在的 tag，脚本先 rm 再 run，run 失败 = 服务直接中断。
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "ERROR: 本机没有镜像 ${IMAGE}，已中止，未删除现有容器。"
+  echo "       先 docker load，或用 --image 指定已存在的 tag（docker images | grep openocr）"
+  exit 1
+fi
+
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 "${CMD[@]}"
 
