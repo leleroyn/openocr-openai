@@ -34,6 +34,18 @@ log.setLevel(os.environ.get("OPENOCR_LOG_LEVEL", "INFO").upper())
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
+# ---- CPU 推理线程上限（共享机器上的关键项）---------------------------------
+# openocr 建 ONNX 会话时不设 intra_op_num_threads，ORT 默认按机器全部核心开线程
+# （24 核 = 每个会话 24 线程）。这台机器是共享的（llama.cpp、strata 等同机跑），
+# CPU 一忙，ORT 的自旋等待线程就互相抢核：实测 loadavg=10 时
+#   单行小图 0.41s -> 1.10s，表格 4.5s -> 11.8s，整页 5.1s -> 11.4s（2.3~2.5 倍）。
+# 限到 8 线程后同样的负载下延迟稳定；空闲时与默认一致；纯线程数，精度不变。
+# 设 0 = 用 ORT 默认（不建议在共享机上用）。
+GPU = os.environ.get("OPENOCR_USE_GPU", "false").lower() in ("1", "true", "yes", "auto")
+CPU_THREADS = int(os.environ.get("OPENOCR_CPU_THREADS", "0"))
+if CPU_THREADS == 0 and not GPU:
+    CPU_THREADS = min(8, os.cpu_count() or 8)
+
 # openocr 的推理日志里有 emoji（🔧 ✅），Windows 下 stdout 被重定向到文件/服务时默认 GBK，
 # 一个 emoji 就能让进程 UnicodeEncodeError 直接退出。统一按 UTF-8 输出，编码不了的字符替换掉。
 for _stream in (sys.stdout, sys.stderr):
@@ -65,6 +77,13 @@ def _session(path_or_bytes, sess_options=None, providers=None, provider_options=
             sess_options = _ort.SessionOptions()
         sess_options.enable_mem_pattern = False
         sess_options.enable_cpu_mem_arena = False
+    # CPU EP：限制单会话线程数，避免共享机上自旋线程抢核（见上面 CPU_THREADS 注释）
+    if CPU_THREADS > 0 and not (providers and "CUDAExecutionProvider" in providers):
+        if sess_options is None:
+            sess_options = _ort.SessionOptions()
+        sess_options.intra_op_num_threads = CPU_THREADS
+        sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL
     return _orig_session(path_or_bytes, sess_options, providers=providers,
                          provider_options=provider_options, **kw)
 
@@ -274,7 +293,6 @@ def _shrink(path: str) -> str:
 
 _engines: dict = {}
 _engine_lock = threading.Lock()   # 防止并发首次请求把同一个模型加载两遍（内存翻倍）
-GPU = os.environ.get("OPENOCR_USE_GPU", "false").lower() in ("1", "true", "yes", "auto")
 _lock = threading.Lock()          # 单实例串行推理，防止显存/内存爆掉
 # doc 任务内部按版面块并行识别（共享同一个 ONNX 会话，ORT 会话线程安全）。
 # CPU 下并行是真提速（session.run 会释放 GIL）；GPU 下并行几乎不涨吞吐，
@@ -307,8 +325,31 @@ def get_engine(model: str):
 
 
 def _warmup():
+    """启动时加载模型 + 各跑一张极小图。
+
+    只加载模型是不够的：ORT 的图优化产物、内存 arena、cuDNN/MLAS 内核都是首次推理才建，
+    不预热的话第一个真实请求要额外付 1~3s，单图场景下这个尾巴特别显眼。
+    """
+    from PIL import Image
     for m in MODELS:
-        get_engine(m)
+        eng = get_engine(m)
+        t0 = time.time()
+        fd, probe = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            Image.fromarray(_np.full((48, 160, 3), 255, _np.uint8)).save(probe)
+            if m == "unirec-0.1b":
+                eng(image_path=probe, max_length=16)
+            else:
+                eng(image_path=probe)
+            log.info("%s 预热完成: %.1fs", m, time.time() - t0)
+        except Exception as exc:      # 预热失败不能拖垮启动
+            log.warning("%s 预热失败（不影响启动）: %s", m, exc)
+        finally:
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
 
 
 @asynccontextmanager
@@ -485,6 +526,7 @@ def _answer(model: str, content: str, stream: bool):
 def health():
     return {"status": "ok", "models": MODELS, "loaded": sorted(_engines),
             "gpu": GPU, "max_pixel_side": MAX_PIXEL_SIDE,
+            "cpu_threads": CPU_THREADS,
             "max_image_kb": MAX_IMAGE_BYTES // 1024,
             "max_parallel_blocks": MAX_PARALLEL_BLOCKS,
             "repeat_guard": REPEAT_GUARD,
