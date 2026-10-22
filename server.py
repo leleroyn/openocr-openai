@@ -1,15 +1,17 @@
-"""OpenAI-compatible API server for OpenOCR (OpenDoc / UniRec), images only, multi-image supported.
+"""OpenAI 兼容的 ScriptMoE OCR 服务：只接受图片输入，支持单请求多图。
 
-设计要点（接入 new-api 等 OpenAI 兼容网关）：
-- 纯文本请求（网关连通性测试）返回 200 + 说明文本，不再返回 400，否则渠道测试过不了。
+接入 new-api 等 OpenAI 兼容网关的设计要点：
+- 纯文本请求（网关的渠道连通性测试）返回 200 + 说明文本，不返回 400，否则渠道测试过不了。
 - 支持 stream=true，按 chat.completion.chunk 吐 SSE，结尾 data: [DONE]。
 - 图片走 content 数组里的 image_url（base64 data URI 或 http(s)），单请求多图。
+
+引擎 = OpenOCR repvit_db 文本检测（ONNX Runtime）+ ScriptMoE 识别（PyTorch），
+输出是按阅读顺序组装的纯文本（见 ocr_engine/pipeline.py 的 assemble_text）。
 """
 import base64
 import json
 import logging
 import os
-import re
 import sys
 import tempfile
 import threading
@@ -34,13 +36,14 @@ log.setLevel(os.environ.get("OPENOCR_LOG_LEVEL", "INFO").upper())
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
-# ---- CPU 推理线程上限（共享机器上的关键项）---------------------------------
+# ---- 推理设备与 CPU 线程上限 -------------------------------------------------
 # openocr 建 ONNX 会话时不设 intra_op_num_threads，ORT 默认按机器全部核心开线程
 # （24 核 = 每个会话 24 线程）。这台机器是共享的（llama.cpp、strata 等同机跑），
 # CPU 一忙，ORT 的自旋等待线程就互相抢核：实测 loadavg=10 时
 #   单行小图 0.41s -> 1.10s，表格 4.5s -> 11.8s，整页 5.1s -> 11.4s（2.3~2.5 倍）。
 # 限到 8 线程后同样的负载下延迟稳定；空闲时与默认一致；纯线程数，精度不变。
-# 设 0 = 用 ORT 默认（不建议在共享机上用）。
+# torch 侧用同一个值（torch.set_num_threads），两个后端对齐，不会互相超订。
+# 设 0 = 用各自默认（不建议在共享机上用）。
 GPU = os.environ.get("OPENOCR_USE_GPU", "false").lower() in ("1", "true", "yes", "auto")
 CPU_THREADS = int(os.environ.get("OPENOCR_CPU_THREADS", "0"))
 if CPU_THREADS == 0 and not GPU:
@@ -56,17 +59,48 @@ for _stream in (sys.stdout, sys.stderr):
 
 _orig_session = _ort.InferenceSession
 
-MODELS = ["opendoc-0.1b", "unirec-0.1b"]
-MAX_TOKENS_CAP = 2048
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 压缩 ONNX Runtime CUDA 显存：4 个会话（opendoc 布局+识别 / unirec 编码+解码）各有独立 arena，
-# arena 只增不还，瞬时峰值会永久抬高上限，默认实测稳态 3.7~4.2GB。
-# 下面关掉 memory pattern 预分配、不让 cuDNN 申请最大卷积 workspace，arena 改为按需扩展。
-# 注意 ORT 1.22 已移除 enable_mem_arena / device_mem_limit，写进 provider_options 会让 CUDA EP
-# 注册失败并静默回退 CPU。
+# 对外只暴露一个模型 id。旧 id 作为 alias 收进来：new-api 上已配好的渠道不用改，
+# 但 /v1/models 只列规范 id，避免网关下拉列表里出现三个一样的引擎。
+MODEL = "scriptmoe"
+MODELS = [MODEL]
+MODEL_ALIASES = {"opendoc-0.1b": MODEL, "unirec-0.1b": MODEL, "scriptmoe-0.1b": MODEL}
+
+# ---- ScriptMoE 引擎配置 ------------------------------------------------------
+# 权重不进 git（191MB safetensors），从上游仓库取：
+#   https://github.com/YesianRohn/ScriptMoE  ->  E2EOCR/model.safetensors + E2EOCR/assets/dict.txt
+# 放到 models/scriptmoe/ 下即可，或用下面两个环境变量指到别处。
+SCRIPTMOE_WEIGHTS = os.environ.get(
+    "SCRIPTMOE_WEIGHTS", os.path.join(BASE_DIR, "models", "scriptmoe", "model.safetensors"))
+SCRIPTMOE_DICT = os.environ.get(
+    "SCRIPTMOE_DICT", os.path.join(BASE_DIR, "models", "scriptmoe", "dict.txt"))
+# 检测模型（repvit_db ONNX）：留空 = 让 openocr 自己下载并缓存到 ~/.cache/openocr。
+# 容器/离线环境提前把 onnx 放进挂载目录，再用这个变量指过去。
+SCRIPTMOE_DET_MODEL = os.environ.get("SCRIPTMOE_DET_MODEL", "")
+# 行宽高比上限：识别张量宽度 = 32 x ratio，encoder 第三段是全局注意力，
+# 单图显存与耗时都随它平方增长。20 = 上游默认，证照/表单这类窄条文字够用。
+SCRIPTMOE_MAX_RATIO = int(os.environ.get("SCRIPTMOE_MAX_RATIO", "20"))
+# 单行最多识别多少个字符（decoder 自回归步数上限）。
+SCRIPTMOE_MAX_TEXT_LENGTH = int(os.environ.get("SCRIPTMOE_MAX_TEXT_LENGTH", "100"))
+# 低于这个识别置信度的行直接丢（上游默认 0.5）。
+SCRIPTMOE_DROP_SCORE = float(os.environ.get("SCRIPTMOE_DROP_SCORE", "0.5"))
+# 一次拼多少个裁条进 batch（同宽高比才拼得进去）。显存 = 权重 + batch x 单图激活，
+# 1050 Ti 4GB 实测 batch 8 x ratio 20 ≈ 1.4GiB 激活，见 README「性能与显存」。
+SCRIPTMOE_REC_BATCH = int(os.environ.get("SCRIPTMOE_REC_BATCH", "8"))
+# 检测器规格：mobile = repvit_db 轻量检测（12MB ONNX）。
+SCRIPTMOE_DET_MODE = os.environ.get("SCRIPTMOE_DET_MODE", "mobile")
+# 输出层兜底：单行结尾被同一个子串刷屏时截断（ScriptMoE 是定长 100 步解码，
+# 一行烧穿的表现就是 '////'、'159595959…' 这种）。阈值 = 同一子串连续重复次数。
+TRIM_MIN_TIMES = int(os.environ.get("OPENOCR_TRIM_MIN_TIMES", "8"))
 
 
 def _session(path_or_bytes, sess_options=None, providers=None, provider_options=None, **kw):
+    """ORT 会话工厂：GPU 压显存 arena，CPU 限线程数（见上面 CPU_THREADS 注释）。
+
+    注意 ORT 1.22 已移除 enable_mem_arena / device_mem_limit，写进 provider_options
+    会让 CUDA EP 注册失败并静默回退 CPU。
+    """
     if providers and "CUDAExecutionProvider" in providers:
         provider_options = [
             {"arena_extend_strategy": "kSameAsRequested",
@@ -77,7 +111,6 @@ def _session(path_or_bytes, sess_options=None, providers=None, provider_options=
             sess_options = _ort.SessionOptions()
         sess_options.enable_mem_pattern = False
         sess_options.enable_cpu_mem_arena = False
-    # CPU EP：限制单会话线程数，避免共享机上自旋线程抢核（见上面 CPU_THREADS 注释）
     if CPU_THREADS > 0 and not (providers and "CUDAExecutionProvider" in providers):
         if sess_options is None:
             sess_options = _ort.SessionOptions()
@@ -90,166 +123,31 @@ def _session(path_or_bytes, sess_options=None, providers=None, provider_options=
 
 _ort.InferenceSession = _session
 
-# ---------------------------------------------------------------------------
-# UniRec 解码层补丁：重复循环早停 + 去掉每步的张量拷贝
-#
-# 库原版解码循环（openocr/tools/infer_unirec_onnx.py 的 _infer_single_image）是纯贪心 argmax，
-# 出口只有 EOS 一个判断，没有任何重复检测；上游后处理也只有 `_{4,}`→`___`、`\.{4,}`→`...` 两条正则，
-# 治不了 token 级循环。模型一旦陷入循环（空白块、密集小字、超宽长条最容易触发），
-# 会一路跑满 max_length 步（默认 2048），单张图白烧几十秒，还全程占着服务端的串行锁，
-# 整个服务被一个请求拖死。
-#
-# 这里在运行时给 UniRecONNX.decode_step 打补丁（不改 site-packages，升级 openocr 后签名不匹配就自动跳过）：
-#   1) 尾部 n-gram 连续重复 k 次 → 把该步 logits 的 argmax 改成 EOS，让库的循环自然 break；
-#   2) 原版每步都对 cross_k/cross_v（整页 encoder 的 KV）和每层 past_key/past_value 无条件
-#      .astype(np.float32)，dtype 本来就是 float32 也照拷。整页 1024px 时 cross KV 有几十 MB，
-#      一次生成几百步就是 GB 级 memcpy，长文本下这块能吃掉解码时间的两三成。
-# ---------------------------------------------------------------------------
-REPEAT_GUARD = os.environ.get("OPENOCR_REPEAT_GUARD", "true").lower() in ("1", "true", "yes")
-# 判定方式：找尾部的最小重复周期 p（1..REPEAT_NGRAM），要求「同一周期连续重复 >= REPEAT_MIN_REPS 次，
-# 且累计 token 数 >= 阈值」才算循环。用周期而不是固定 n-gram，才能抓到 <td>金额</td> 这种 3 token 周期的小循环。
-REPEAT_NGRAM = int(os.environ.get("OPENOCR_REPEAT_NGRAM", "8"))          # 检测的最大周期
-REPEAT_MIN_REPS = int(os.environ.get("OPENOCR_REPEAT_MIN_REPS", "3"))    # 至少完整重复几遍
-REPEAT_MIN_TOKENS = int(os.environ.get("OPENOCR_REPEAT_MIN_TOKENS", "32"))        # 正文：连续重复这么多 token 判定循环
-# 表格专用：<td></td>、|---|、|  | 这类纯结构 token 的重复是表格骨架本身，阈值放宽 3 倍
-# （96 token ≈ 48 个连续空单元格），否则空单元格多的表会被误截。
-REPEAT_STRUCT_MIN_TOKENS = int(os.environ.get("OPENOCR_REPEAT_STRUCT_MIN_TOKENS", "96"))
-# 输出层兜底（解码层早停之外的补漏），同样区分正文/表格骨架
-TRIM_MIN_TIMES = int(os.environ.get("OPENOCR_TRIM_MIN_TIMES", "8"))
-TRIM_STRUCT_MIN_TIMES = int(os.environ.get("OPENOCR_TRIM_STRUCT_MIN_TIMES", "24"))
-
-# 去掉 HTML 标签后只剩分隔符/空白/标点的片段 = 纯结构（表格骨架），不含任何文字
-_TAG_RE = re.compile(r"<[^>]*>")
-_CONTENT_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-
-
-def _is_structural(text: str) -> bool:
-    """这段文本是不是纯表格骨架（<td></td>、|---|、|  | 之类，没有任何实际文字/数字）。"""
-    stripped = _TAG_RE.sub("", text)
-    if not stripped.strip():
-        return True
-    return not _CONTENT_RE.search(stripped)
-
-
-_repeat_state = threading.local()   # 每个 worker 线程一次只跑一个生成（doc 任务多线程共享同一 session）
-
-
-def _count_tail_reps(seq, unit_len: int) -> int:
-    """尾部 unit_len 长度的片段连续重复了几次。"""
-    L = len(seq)
-    if unit_len <= 0 or L < unit_len:
-        return 0
-    tail = seq[-unit_len:]
-    reps = 1
-    while L - unit_len * (reps + 1) >= 0 and seq[L - unit_len * (reps + 1):L - unit_len * reps] == tail:
-        reps += 1
-    return reps
-
-
-def _tail_period(seq):
-    """尾部最小重复周期及其重复次数：返回 (period, reps)，无重复时 (1, 1)。"""
-    for p in range(1, min(REPEAT_NGRAM, len(seq)) + 1):
-        reps = _count_tail_reps(seq, p)
-        if reps >= REPEAT_MIN_REPS:
-            return p, reps
-    return 1, 1
-
-
-def _is_repeating(seq, texts=None) -> bool:
-    """seq 尾部是否已进入重复循环。texts 是对应 token 的文本，用来区分表格骨架与正文。
-
-    表格输出天然高度周期化（每行结构一样），所以只看「重复得有多长」会误伤正常表格：
-    判定单位是连续重复的 token 总数，且纯结构（没有任何文字/数字）的重复阈值放宽 3 倍。
-    """
-    p, reps = _tail_period(seq)
-    if reps < REPEAT_MIN_REPS:
-        return False
-    unit_txt = "".join(texts[-p:]) if texts else ""
-    structural = bool(texts) and _is_structural(unit_txt)
-    need = REPEAT_STRUCT_MIN_TOKENS if structural else REPEAT_MIN_TOKENS
-    return p * reps >= need
-
 
 def _trim_repeats(text: str) -> str:
-    """输出层兜底：结尾被同一个子串刷屏时截断（解码层早停之外的补漏）。
-
-    纯结构重复（表格骨架）阈值放宽到 TRIM_STRUCT_MIN_TIMES，避免误截空单元格多的表。
-    """
+    """单行文本结尾的重复刷屏截断（引擎输出是逐行文字，没有表格骨架要保护）。"""
     n = len(text)
     if n < 24:
         return text
     for L in range(1, 25):
         unit = text[-L:]
-        need = TRIM_STRUCT_MIN_TIMES if _is_structural(unit) else TRIM_MIN_TIMES
-        if n < L * need:
+        if n < L * TRIM_MIN_TIMES:
             continue
         reps = 1
         i = n - L
         while i - L >= 0 and text[i - L:i] == unit:
             reps += 1
             i -= L
-        if reps >= need:
+        if reps >= TRIM_MIN_TIMES:
             return text[:i + L].rstrip() + "…"
     return text
 
 
-def _patch_unirec(cls) -> None:
-    """给 UniRecONNX 类打补丁（doc 任务的 vlm_recognizer 也是这个类，一处覆盖两个引擎）。"""
-    if not hasattr(cls, "decode_step") or getattr(cls.decode_step, "_ocr_patched", False):
-        return
-    import inspect
-    params = list(inspect.signature(cls.decode_step).parameters)
-    if params[:6] != ["self", "input_id", "past_length", "cross_k", "cross_v", "past_key_values"]:
-        log.warning("UniRecONNX.decode_step 签名已变，跳过解码补丁（重复循环防护与拷贝优化不生效）")
-        return
-
-    def decode_step(self, input_id, past_length, cross_k, cross_v, past_key_values, padding_idx=1):
-        hist = getattr(_repeat_state, "hist", None)
-        if hist is None or past_length == 0:
-            hist = []
-            _repeat_state.hist = hist
-            _repeat_state.texts = []
-            _repeat_state.steps = 0
-            _repeat_state.stopped = False
-        tid = int(input_id)
-        hist.append(tid)
-        _repeat_state.steps = past_length + 1
-        id2tok = getattr(self.tokenizer, "id_to_token", None)
-        _repeat_state.texts.append(id2tok.get(tid, "") if isinstance(id2tok, dict) else "")
-
-        f32 = _np.float32
-        ck = cross_k if cross_k.dtype == f32 else cross_k.astype(f32)
-        cv = cross_v if cross_v.dtype == f32 else cross_v.astype(f32)
-        cache = [(k, v) if k.dtype == f32 and v.dtype == f32
-                 else (k.astype(f32), v.astype(f32)) for k, v in past_key_values]
-
-        logits, present = self._ocr_orig_decode_step(input_id, past_length, ck, cv, cache,
-                                                     padding_idx=padding_idx)
-
-        if REPEAT_GUARD and len(hist) >= REPEAT_MIN_TOKENS \
-                and _is_repeating(hist, _repeat_state.texts):
-            eos = int(getattr(self.tokenizer, "eos_token_id", 2))
-            row = logits[0, -1]
-            if 0 <= eos < row.shape[0]:
-                row[:] = -1e30
-                row[eos] = 1.0
-                _repeat_state.stopped = True
-                log.warning("检测到重复输出，已在第 %d 步强制结束（连续重复 %d token，周期 %d，正文阈值 %d / 表格骨架阈值 %d）",
-                            past_length + 1, len(hist), _tail_period(hist)[0],
-                            REPEAT_MIN_TOKENS, REPEAT_STRUCT_MIN_TOKENS)
-        return logits, present
-
-    decode_step._ocr_patched = True
-    cls._ocr_orig_decode_step = cls.decode_step
-    cls.decode_step = decode_step
-    log.info("UniRec 解码补丁已生效：重复循环早停 周期<=%d 且连续重复>=%d token（表格骨架 %d token）",
-             REPEAT_NGRAM, REPEAT_MIN_TOKENS, REPEAT_STRUCT_MIN_TOKENS)
-
-
-# 前置缩放压显存（不改 openocr 任何配置）。
-# UniRec 的 SimpleImageProcessor 只做"超过 max_side(960x1408) 才缩小"，输入小于该尺寸时原样使用。
-# encoder 自注意力显存随 token 数增长，所以在进模型前把最长边压到 MAX_PIXEL_SIDE，模型侧参数一个都不动。
-MAX_PIXEL_SIDE = int(os.environ.get("OPENOCR_MAX_PIXEL_SIDE", "1024"))
+# 前置缩放：默认关闭（0 = 原图直接进模型）。识别裁条会被统一压到 32 高的固定分辨率，
+# 检测器自己也按固定边长缩放，所以缩放对精度没有好处，只当解码炸弹的保险丝用：
+# 一张 20MB 的 JPEG 解出来可能是 10000x10000 = 300MB 内存，这时把它设成 4096 之类。
+# 精度侧的实测结论（462 张营业执照）：原图 > 2048px > 1024px，能原图就原图。
+MAX_PIXEL_SIDE = int(os.environ.get("OPENOCR_MAX_PIXEL_SIDE", "0"))
 # 单图体积上限（base64 解码后的原始字节），超过则重编码 JPEG。
 MAX_IMAGE_BYTES = int(os.environ.get("OPENOCR_MAX_IMAGE_KB", "5120")) * 1024
 # 远端图片：下载超时与体积上限（无上限时一张 500MB 的图能把内存打满）
@@ -261,20 +159,32 @@ MAX_BODY_BYTES = int(os.environ.get("OPENOCR_MAX_BODY_MB", "64")) * 1024 * 1024
 
 def _shrink(path: str) -> str:
     """超限图片等比压缩为 JPEG（<=MAX_IMAGE_BYTES），返回新路径并删除原文件。"""
-    from PIL import Image
+    from PIL import Image, ImageOps
     try:
         im = Image.open(path)
         im.load()
     except Exception:
         return path
+    orig_size = im.size
+    # EXIF 方向：手机/微信拍的证照绝大多数带 Orientation 标签（6=顺时针 90°），
+    # 而检测/识别侧用 cv2.imdecode 读图，**不看 EXIF**，等于把图旋转 90° 喂给模型，
+    # 整页识别质量直接崩。这里统一按 EXIF 转正（无标签时是空操作）。
+    # 需要转正时 (w, h) != orig_size 一定成立，所以一定会走到下面的重编码分支落盘，
+    # 不存在「转正了但没存盘」的中间态。
+    try:
+        im = ImageOps.exif_transpose(im)
+    except Exception:
+        pass
     w, h = im.size
-    need = os.path.getsize(path) > MAX_IMAGE_BYTES or max(w, h) > MAX_PIXEL_SIDE
+    need = (os.path.getsize(path) > MAX_IMAGE_BYTES
+             or (MAX_PIXEL_SIDE > 0 and max(w, h) > MAX_PIXEL_SIDE)
+             or (w, h) != orig_size)
     if not need:
         return path
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
     side = max(im.size)
-    if side > MAX_PIXEL_SIDE:
+    if MAX_PIXEL_SIDE > 0 and side > MAX_PIXEL_SIDE:
         r = MAX_PIXEL_SIDE / float(side)
         im = im.resize((max(1, int(im.width * r)), max(1, int(im.height * r))), Image.LANCZOS)
     out = path + ".c.jpg"
@@ -291,65 +201,67 @@ def _shrink(path: str) -> str:
     return out
 
 
-_engines: dict = {}
-_engine_lock = threading.Lock()   # 防止并发首次请求把同一个模型加载两遍（内存翻倍）
+_engine = None
+_engine_lock = threading.Lock()   # 防止并发首次请求把模型加载两遍（内存翻倍）
 _lock = threading.Lock()          # 单实例串行推理，防止显存/内存爆掉
-# doc 任务内部按版面块并行识别（共享同一个 ONNX 会话，ORT 会话线程安全）。
-# CPU 下并行是真提速（session.run 会释放 GIL）；GPU 下并行几乎不涨吞吐，
-# 只会抬高解码峰值显存，所以默认 CPU=4、GPU=1。
-MAX_PARALLEL_BLOCKS = int(os.environ.get(
-    "OPENOCR_MAX_PARALLEL_BLOCKS", "1" if GPU else "4"))
 
 
-def get_engine(model: str):
-    if model in _engines:
-        return _engines[model]
+def get_engine():
+    global _engine
+    if _engine is not None:
+        return _engine
     with _engine_lock:
-        if model in _engines:
-            return _engines[model]
-        from openocr import OpenOCR
-        if model == "opendoc-0.1b":
-            eng = OpenOCR(task="doc", use_layout_detection=True, use_gpu=GPU,
-                          max_parallel_blocks=MAX_PARALLEL_BLOCKS)
-        elif model == "unirec-0.1b":
-            eng = OpenOCR(task="unirec", use_gpu=GPU)
-        else:
-            raise KeyError(model)
-        # doc 引擎的识别器是引擎内部的 vlm_recognizer，unirec 引擎本身就是 UniRecONNX
-        rec = getattr(getattr(eng, "model", None), "vlm_recognizer", None) \
-            if model == "opendoc-0.1b" else getattr(eng, "model", None)
-        if rec is not None:
-            _patch_unirec(type(rec))
-        _engines[model] = eng
-        return eng
+        if _engine is None:
+            from ocr_engine import ScriptMoEOcr
+            _engine = ScriptMoEOcr(
+                weights_path=SCRIPTMOE_WEIGHTS,
+                char_dict_path=SCRIPTMOE_DICT,
+                use_gpu="true" if GPU else "false",
+                det_mode=SCRIPTMOE_DET_MODE,
+                det_model_path=SCRIPTMOE_DET_MODEL or None,
+                drop_score=SCRIPTMOE_DROP_SCORE,
+                rec_batch_num=SCRIPTMOE_REC_BATCH,
+                max_text_length=SCRIPTMOE_MAX_TEXT_LENGTH,
+                max_ratio=SCRIPTMOE_MAX_RATIO,
+                threads=CPU_THREADS,
+            )
+            log.info("ScriptMoE 已加载: device=%s det=%s weights=%s (%.1fs)",
+                     _engine.device, SCRIPTMOE_DET_MODE, SCRIPTMOE_WEIGHTS,
+                     _engine.load_seconds)
+    return _engine
+
+
+def _run_scriptmoe(engine, img_path: str):
+    """单图推理 -> (纯文本, 耗时明细)。逐行做重复截断后按阅读顺序重新组装。"""
+    from ocr_engine import assemble_text
+    text, lines, timing = engine.infer_file(img_path)
+    if lines:
+        text = assemble_text([dict(l, text=_trim_repeats(l["text"])) for l in lines])
+    return text, timing
 
 
 def _warmup():
-    """启动时加载模型 + 各跑一张极小图。
+    """启动时加载模型 + 跑一张极小图。
 
-    只加载模型是不够的：ORT 的图优化产物、内存 arena、cuDNN/MLAS 内核都是首次推理才建，
-    不预热的话第一个真实请求要额外付 1~3s，单图场景下这个尾巴特别显眼。
+    只加载模型是不够的：ORT 的图优化产物、内存 arena、torch 首次算子分发都是首次推理
+    才建，不预热的话第一个真实请求要额外付 1~3s（GPU 更多），单图场景下尾巴很显眼。
     """
     from PIL import Image
-    for m in MODELS:
-        eng = get_engine(m)
-        t0 = time.time()
-        fd, probe = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
+    eng = get_engine()
+    t0 = time.time()
+    fd, probe = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        Image.fromarray(_np.full((48, 160, 3), 255, _np.uint8)).save(probe)
+        _run_scriptmoe(eng, probe)
+        log.info("预热完成: %.1fs", time.time() - t0)
+    except Exception as exc:      # 预热失败不能拖垮启动
+        log.warning("预热失败（不影响启动）: %s", exc)
+    finally:
         try:
-            Image.fromarray(_np.full((48, 160, 3), 255, _np.uint8)).save(probe)
-            if m == "unirec-0.1b":
-                eng(image_path=probe, max_length=16)
-            else:
-                eng(image_path=probe)
-            log.info("%s 预热完成: %.1fs", m, time.time() - t0)
-        except Exception as exc:      # 预热失败不能拖垮启动
-            log.warning("%s 预热失败（不影响启动）: %s", m, exc)
-        finally:
-            try:
-                os.remove(probe)
-            except OSError:
-                pass
+            os.remove(probe)
+        except OSError:
+            pass
 
 
 @asynccontextmanager
@@ -358,7 +270,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="OpenOCR OpenAI-compatible API", version="1.2", lifespan=lifespan)
+app = FastAPI(title="ScriptMoE OpenAI-compatible API", version="2.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -366,7 +278,8 @@ async def _body_limit(request: Request, call_next):
     """请求体上限：base64 图片直接进 JSON body，不设上限时一个大请求就能把内存打满。"""
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-        return _err(413, f"请求体 {cl} 字节，超过上限 {MAX_BODY_BYTES // (1024 * 1024)}MB")
+        return _err(413, "请求体 " + cl + " 字节，超过上限 "
+                    + str(MAX_BODY_BYTES // (1024 * 1024)) + "MB")
     return await call_next(request)
 
 
@@ -382,6 +295,9 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    # max_tokens 是 OpenAI 协议的习惯字段：接受但不参与推理控制。ScriptMoE 是
+    # 「逐行定长解码」：单行上限 SCRIPTMOE_MAX_TEXT_LENGTH 个字符，行数由检测框决定，
+    # 没有全局 token 预算可以截断。
     model: str
     messages: list[ChatMessage]
     max_tokens: int | None = 2048
@@ -394,9 +310,9 @@ def _err(status: int, message: str, etype: str = "invalid_request_error") -> JSO
 
 
 def _fetch_url(url: str, suffix: str) -> str:
-    """下载远端图片：带超时与体积上限。原版 urlretrieve 无超时，URL 卡住会永久占住 worker 线程。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "openocr-openai/1.2"})
-    p = os.path.join(tempfile.gettempdir(), f"oocr_{uuid.uuid4().hex}{suffix}")
+    """下载远端图片：带超时与体积上限。urlretrieve 无超时，URL 卡住会永久占住 worker 线程。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "openocr-openai/2.0"})
+    p = os.path.join(tempfile.gettempdir(), "oocr_" + uuid.uuid4().hex + suffix)
     total = 0
     with urllib.request.urlopen(req, timeout=URL_TIMEOUT) as resp, open(p, "wb") as f:
         while True:
@@ -405,7 +321,7 @@ def _fetch_url(url: str, suffix: str) -> str:
                 break
             total += len(chunk)
             if total > MAX_URL_BYTES:
-                raise ValueError(f"远端图片超过 {MAX_URL_BYTES // (1024 * 1024)}MB 上限")
+                raise ValueError("远端图片超过 " + str(MAX_URL_BYTES // (1024 * 1024)) + "MB 上限")
             f.write(chunk)
     if total == 0:
         raise ValueError("远端图片为空")
@@ -426,7 +342,7 @@ def _extract_images(messages: list[ChatMessage]) -> list[str]:
                 header, b64 = url.split(",", 1)
                 ext = header.split(";")[0].split("/")[-1].split("+")[0]
                 suffix = {"jpeg": "jpg"}.get(ext, ext) or "png"
-                p = os.path.join(tempfile.gettempdir(), f"oocr_{uuid.uuid4().hex}.{suffix}")
+                p = os.path.join(tempfile.gettempdir(), "oocr_" + uuid.uuid4().hex + "." + suffix)
                 with open(p, "wb") as f:
                     f.write(base64.b64decode(b64))
                 paths.append(p)
@@ -434,59 +350,29 @@ def _extract_images(messages: list[ChatMessage]) -> list[str]:
                 suffix = os.path.splitext(url.split("?")[0])[1] or ".png"
                 paths.append(_fetch_url(url, suffix))
             else:
-                raise ValueError(f"不支持的 image_url: {url[:80]}")
+                raise ValueError("不支持的 image_url: " + url[:80])
     return paths
-
-
-def _run_opendoc(engine, img_path: str) -> str:
-    result = engine(image_path=img_path)
-    pages = result if isinstance(result, list) else [result]
-    outs = []
-    for page in pages:
-        with tempfile.TemporaryDirectory() as td:
-            engine.save_to_markdown(page, td)
-            for root, _dirs, files in os.walk(td):
-                for fn in files:
-                    if fn.endswith(".md"):
-                        with open(os.path.join(root, fn), encoding="utf-8") as f:
-                            outs.append(f.read())
-    return "\n\n".join(outs)
-
-
-def _run_unirec(engine, img_path: str, max_tokens: int) -> str:
-    _repeat_state.stopped = False
-    _repeat_state.steps = 0
-    text, _ = engine(image_path=img_path, max_length=max_tokens)
-    text = _trim_repeats(text)
-    if getattr(_repeat_state, "stopped", False):
-        log.warning("unirec 输出被重复防护截断: %s", os.path.basename(img_path))
-    # 跑满 token 预算说明是被长度切断的，不是模型自然收尾 —— 表格/长文档最常见，
-    # 静默截断会让调用方拿到半张表，所以显式标记出来。
-    if getattr(_repeat_state, "steps", 0) >= max_tokens - 1:
-        log.warning("unirec 输出达到 max_tokens=%d 上限，已标记截断: %s", max_tokens, os.path.basename(img_path))
-        text += (f"\n\n> ⚠️ 输出达到 max_tokens={max_tokens} 上限，内容被截断。"
-                 f"表格/长文档请把大图按行块切分后分多次请求（服务端上限 {MAX_TOKENS_CAP}）。")
-    return text
 
 
 def _notice(model: str) -> str:
     """无图片请求（网关连通性测试）的说明文本。"""
     return (
-        f"OpenOCR 服务在线，模型 `{model}` 可用。\n\n"
+        "ScriptMoE 服务在线，模型 " + model + " 可用。\n\n"
         "这是纯 OCR 模型，只接受图片输入：请在 messages 的 content 数组里放 image_url"
         "（base64 data URI 或 http(s) 链接），支持单请求多图。\n"
-        f"可用模型：{', '.join(MODELS)}（opendoc-0.1b=整页文档转 Markdown，unirec-0.1b=单行/单块文字识别）。\n"
+        "可用模型：" + ", ".join(MODELS) + "（文本检测 + ScriptMoE 多语种识别，"
+        "输出按阅读顺序组装的纯文本，单请求多图）。\n"
         "本条是无图片请求的连通性应答，未执行推理。"
     )
 
 
-def _sse(obj: dict) -> str:
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+def _sse(chunk: dict) -> str:
+    return "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
 
 
 def _answer(model: str, content: str, stream: bool):
-    """统一出口：非流式返回 chat.completion，流式返回 chat.completion.chunk 序列。"""
-    cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    """非流式返回 chat.completion，流式返回 chat.completion.chunk 序列。"""
+    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     if not stream:
         return {
@@ -524,14 +410,20 @@ def _answer(model: str, content: str, stream: bool):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models": MODELS, "loaded": sorted(_engines),
-            "gpu": GPU, "max_pixel_side": MAX_PIXEL_SIDE,
+    return {"status": "ok", "models": MODELS, "loaded": [MODEL] if _engine else [],
+            "gpu": GPU, "device": _engine.device if _engine else None,
+            "det_mode": SCRIPTMOE_DET_MODE,
+            "max_ratio": SCRIPTMOE_MAX_RATIO,
+            "max_text_length": SCRIPTMOE_MAX_TEXT_LENGTH,
+            "rec_batch": SCRIPTMOE_REC_BATCH,
+            "drop_score": SCRIPTMOE_DROP_SCORE,
             "cpu_threads": CPU_THREADS,
+            "weights": SCRIPTMOE_WEIGHTS,
+            "char_dict": SCRIPTMOE_DICT,
+            "det_model": SCRIPTMOE_DET_MODEL or "auto-download",
+            "max_pixel_side": MAX_PIXEL_SIDE,
             "max_image_kb": MAX_IMAGE_BYTES // 1024,
-            "max_parallel_blocks": MAX_PARALLEL_BLOCKS,
-            "repeat_guard": REPEAT_GUARD,
-            "repeat_min_tokens": REPEAT_MIN_TOKENS,
-            "repeat_struct_min_tokens": REPEAT_STRUCT_MIN_TOKENS,
+            "trim_min_times": TRIM_MIN_TIMES,
             "url_timeout_s": URL_TIMEOUT, "max_url_mb": MAX_URL_BYTES // (1024 * 1024),
             "max_body_mb": MAX_BODY_BYTES // (1024 * 1024)}
 
@@ -540,42 +432,45 @@ def health():
 def list_models():
     return {"object": "list",
             "data": [{"id": m, "object": "model", "created": int(time.time()),
-                      "owned_by": "openocr"} for m in MODELS]}
+                      "owned_by": "scriptmoe"} for m in MODELS]}
 
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    if req.model not in MODELS:
-        return _err(404, f"模型不存在: {req.model}，可用: {MODELS}", "model_not_found")
-    max_tokens = req.max_tokens or 2048
-    max_tokens = max(1, min(int(max_tokens), MAX_TOKENS_CAP))
+    model = MODEL_ALIASES.get(req.model, req.model)
+    if model not in MODELS:
+        return _err(404, "模型不存在: " + str(req.model) + "，可用: " + str(MODELS),
+                    "model_not_found")
     try:
         images = _extract_images(req.messages)
     except Exception as e:
-        return _err(400, f"图片解析失败: {e}")
+        return _err(400, "图片解析失败: " + str(e))
 
     # 无图片：返回 200 说明文本。网关（new-api 等）连通性测试只发纯文本，
     # 这里回 400 会让渠道测试判定失败，所以必须 200。
     if not images:
-        return _answer(req.model, _notice(req.model), req.stream)
+        return _answer(model, _notice(model), req.stream)
 
     images = [_shrink(p) for p in images]
-    engine = get_engine(req.model)
+    engine = get_engine()
     contents = []
     t0 = time.time()
+    det_ms = rec_ms = 0.0
+    n_boxes = n_kept = 0
     try:
         with _lock:
             for i, p in enumerate(images):
-                if req.model == "unirec-0.1b":
-                    text = _run_unirec(engine, p, max_tokens)
-                else:
-                    text = _run_opendoc(engine, p)
+                text, timing = _run_scriptmoe(engine, p)
+                det_ms += timing["det_ms"]
+                rec_ms += timing["rec_ms"]
+                n_boxes += timing["num_boxes"]
+                n_kept += timing["num_kept"]
                 name = os.path.basename(p)
-                header = f"### 图片 {i + 1}/{len(images)}: {name}\n\n" if len(images) > 1 else ""
-                contents.append(header + text.strip())
+                header = "### 图片 " + str(i + 1) + "/" + str(len(images)) + ": " + name + "\n\n"
+                contents.append(header + text.strip() if len(images) > 1 else text.strip())
     except Exception as e:
         log.exception("推理失败")
-        return _err(500, f"推理失败: {e}", "server_error")
+        return _err(500, "推理失败: " + str(e), "server_error")
     finally:
         for p in images:
             try:
@@ -583,9 +478,10 @@ def chat_completions(req: ChatCompletionRequest):
             except OSError:
                 pass
 
-    log.info("%s | %d 图 | %.1fs | %d 字", req.model, len(images), time.time() - t0,
-             sum(len(c) for c in contents))
-    return _answer(req.model, "\n\n---\n\n".join(contents), req.stream)
+    log.info("%s | %d 图 | 框 %d 留 %d | det %.0fms rec %.0fms | 总计 %.1fs | %d 字",
+             model, len(images), n_boxes, n_kept, det_ms, rec_ms,
+             time.time() - t0, sum(len(c) for c in contents))
+    return _answer(model, "\n\n---\n\n".join(contents), req.stream)
 
 
 if __name__ == "__main__":

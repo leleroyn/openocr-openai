@@ -1,10 +1,10 @@
 #!/bin/bash
 # curl 调用示例: bash examples/curl.sh <图片路径>
-# 环境变量: OCR_BASE(默认 http://127.0.0.1:8089/v1)  OCR_MODEL(默认 opendoc-0.1b)
+# 环境变量: OCR_BASE(默认 http://127.0.0.1:8089/v1)  OCR_MODEL(默认 scriptmoe)
 set -euo pipefail
 
 BASE="${OCR_BASE:-http://127.0.0.1:8089/v1}"
-MODEL="${OCR_MODEL:-opendoc-0.1b}"
+MODEL="${OCR_MODEL:-scriptmoe}"   # 旧 id opendoc-0.1b / unirec-0.1b 走别名照样能用
 IMG="${1:?用法: bash examples/curl.sh <图片路径>}"
 
 echo "== /health =="

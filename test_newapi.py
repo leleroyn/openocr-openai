@@ -12,7 +12,8 @@ import time
 import requests
 
 BASE = os.environ.get("OCR_BASE", "http://127.0.0.1:8089/v1")
-MODEL = "opendoc-0.1b"
+MODEL = "scriptmoe"
+LEGACY = "unirec-0.1b"      # 旧 id：必须作为别名照样能跑
 
 
 def img_part(path: str) -> dict:
@@ -64,19 +65,21 @@ post("1 纯文本(网关测试)", {"model": MODEL, "messages": [{"role": "user",
 post("2 纯文本+流式", {"model": MODEL, "messages": [{"role": "user", "content": "你好"}], "stream": True}, stream=True)
 # 3. content 数组只有 text part
 post("3 数组仅text", {"model": MODEL, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]})
-# 4. 未知模型
-post("4 未知模型", {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
-# 5. 带网关常见附加字段
-post("5 附加字段", {"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
+# 4. 旧模型 id（网关上已配好的渠道）：走别名映射，必须 200
+post("4 旧id别名", {"model": LEGACY, "messages": [{"role": "user", "content": "你好"}]})
+# 5. 未知模型
+post("5 未知模型", {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
+# 6. 带网关常见附加字段
+post("6 附加字段", {"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
                   "temperature": 0.7, "n": 1, "presence_penalty": 0, "seed": 1,
                   "user": "new-api", "response_format": {"type": "text"}})
 
 if len(sys.argv) > 1:
     p = sys.argv[1]
     parts = [img_part(p)]
-    # 6. 图片非流式
-    post("6 图片非流式", {"model": MODEL, "messages": [{"role": "user", "content": parts}]})
-    # 7. 图片流式
-    post("7 图片+流式", {"model": MODEL, "messages": [{"role": "user", "content": parts}], "stream": True}, stream=True)
-    # 8. 图片 + 文本混合（网关常见）
-    post("8 图片+文本", {"model": MODEL, "messages": [{"role": "user", "content": parts + [{"type": "text", "text": "识别"}]}]})
+    # 7. 图片非流式
+    post("7 图片非流式", {"model": MODEL, "messages": [{"role": "user", "content": parts}]})
+    # 8. 图片流式
+    post("8 图片+流式", {"model": MODEL, "messages": [{"role": "user", "content": parts}], "stream": True}, stream=True)
+    # 9. 图片 + 文本混合（网关常见）
+    post("9 图片+文本", {"model": MODEL, "messages": [{"role": "user", "content": parts + [{"type": "text", "text": "识别"}]}]})

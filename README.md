@@ -1,11 +1,20 @@
-# OpenOCR OpenAI 兼容接口服务
+# ScriptMoE OpenAI 兼容 OCR 服务
 
-把 [OpenOCR](https://github.com/Topdu/OpenOCR) 的 **OpenDoc-0.1B**（整页文档解析 → Markdown）与
-**UniRec-0.1B**（通用文字 / 公式 / 表格识别）封装成 **OpenAI Chat Completions 兼容** 的 HTTP 服务，
-任何 OpenAI 客户端 / SDK / 网关（new-api、one-api、LiteLLM…）改一下 base_url 就能直接调用 OCR。
+把 [ScriptMoE](https://github.com/YesianRohn/ScriptMoE)（45.9M 参数的多语种 OCR 识别模型）封装成
+**OpenAI Chat Completions 兼容** 的 HTTP 服务：任何 OpenAI 客户端 / SDK / 网关
+（new-api、one-api、LiteLLM…）改一下 base_url 就能直接调用 OCR。
 
-> 纯 OCR 模型：**只接受图片输入**（base64 data URI 或 http(s) 链接），支持单请求多图；
-> 没有对话语义，不消耗 token 计费（`usage` 恒为 0）。
+检测 + 识别两段式：
+
+| 环节 | 模型 | 运行时 |
+|---|---|---|
+| 文本检测 | OpenOCR repvit_db（12MB ONNX） | ONNX Runtime（CPU / CUDA EP） |
+| 文字识别 | ScriptMoE（SVTRv2 encoder + MoE decoder，47.8M 参数） | PyTorch（CPU / CUDA） |
+
+输出是**按阅读顺序组装的纯文本**：带框的文字行先按 y 聚成文本行，行内按 x 拼接，行间换行。
+
+> 纯 OCR 模型：只接受图片输入（base64 data URI 或 http(s) 链接），支持单请求多图；
+> 没有对话语义，不消耗 token 计费（usage 恒为 0）。
 
 <p>
   <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
@@ -24,7 +33,8 @@
 - [接入 new-api / one-api 网关](#接入-newapi--oneapi-网关)
 - [配置项](#配置项)
 - [性能与显存](#性能与显存)
-- [循环输出防护](#循环输出防护)
+- [与 OpenDoc / UniRec 的差异](#与-opendoc--unirec-的差异)
+- [输出防护](#输出防护)
 - [自检脚本](#自检脚本)
 - [项目结构](#项目结构)
 - [限制与注意事项](#限制与注意事项)
@@ -36,347 +46,323 @@
 - **支持流式**：`stream=true` 走标准 SSE（`chat.completion.chunk` + 结尾 `data: [DONE]`）。
 - **网关友好**：纯文本请求（网关的渠道连通性测试）返回 **200 + 能力说明文本**，不返回 400，渠道测试直接通过。
 - **单请求多图**：多图按顺序逐张识别，结果按 `### 图片 i/N` 分段拼接。
-- **前置缩放压显存**：进模型前把最长边压到上限并重编码 JPEG，**不改 OpenOCR / ONNX 任何配置**，显存随边长四次方下降。
-- **GPU / CPU 一键切换**：`OPENOCR_USE_GPU=true` 走 CUDA，显存不够时一条命令回退 CPU。
-- **重复循环早停（表格友好）**：UniRec 是纯贪心解码，库原版只有 EOS 一个出口，一旦陷入循环会跑满 2048 步；服务端在解码层加了周期检测，正文循环第 34 步切断，**表格骨架（`<td></td>`、`|---|`）阈值放宽 3 倍**，正常大表不会被误伤（见[循环输出防护](#循环输出防护)）。
-- **截断显式标记**：输出跑满 `max_tokens` 时在 content 里追加警告行，不会让你拿到半张表还不自知。
-- **资源上限齐全**：请求体、远端图片体积、下载超时、并发块数全部可配，不会被一个大请求拖死。
+- **阅读顺序组装**：同一行上的「标签 + 值」拼成一行，行内按 x 排序，两侧都是中文时不插空格、中英文相邻插一个空格 —— 证照/表单按行抽字段最省事。
+- **旧模型 id 兼容**：`opendoc-0.1b`、`unirec-0.1b` 作为别名映射到 `scriptmoe`，new-api 上已配好的渠道不用改；`/v1/models` 只列规范 id。
+- **GPU / CPU 一键切换**：`OPENOCR_USE_GPU=true` 走 CUDA，一条命令回退 CPU。
+- **逐行重复截断**：ScriptMoE 是定长 100 步解码，一行被同一子串刷屏（`////`、`159595959…`）时截断，正常重复行（整表同内容的行）不受影响。
+- **资源上限齐全**：请求体、远端图片体积与超时、识别 batch、行宽高比全部可配，不会被一个大请求拖死。
 - **单锁串行推理**：并发请求排队，避免显存/内存被打爆。
+- **CPU 线程上限**：ORT 与 torch 用同一个 `OPENOCR_CPU_THREADS`，共享机器上不会自旋线程抢核（实测限线程后延迟稳定）。
 - **零依赖客户端**：curl / Python / Java / Node 任何能发 HTTP POST JSON 的语言都能用。
-
 ## 快速开始
+
+### 0. 取权重（不进 git）
+
+| 文件 | 大小 | 来源 |
+|---|---|---|
+| `model.safetensors` | 191MB | ScriptMoE 仓库 `E2EOCR/model.safetensors`（git-lfs） |
+| `dict.txt` | 95KB | 同仓库 `E2EOCR/assets/dict.txt`（19683 字符 + 空格） |
+
+放到 `models/scriptmoe/` 下即可（裸机）；Docker 挂载 `/app/models`（见下）。
+检测权重 `openocr_det_model.onnx`（12MB）首次启动由 openocr 走 modelscope 自动下载并缓存。
 
 ### 1. Docker（推荐）
 
 ```bash
-docker build -t openocr-openai:1.0 .
+docker build -t openocr-openai:2.0 .
+docker run -d --name openocr-openai \
+  -p 8089:8089 \
+  -v /data/ocr/openocr-openai/models:/app/models \
+  -v /data/ocr/openocr-openai/models:/root/.cache/openocr \
+  openocr-openai:2.0
 
-# CPU 模式（无需显卡，最稳）
-docker run -d --name openocr-openai -p 8089:8089 \
-  -v $PWD/models:/root/.cache/openocr \
-  openocr-openai:1.0
-
-# GPU 模式（需空闲显存 >= 4.5GB）
-docker run -d --name openocr-openai --gpus all -p 8089:8089 \
-  -v $PWD/models:/root/.cache/openocr \
-  -e OPENOCR_USE_GPU=true \
-  openocr-openai:1.0
+curl -s http://127.0.0.1:8089/health
+# {"status":"ok","models":["scriptmoe"],"loaded":["scriptmoe"],"gpu":false,"device":"cpu",
+#  "det_mode":"mobile","max_ratio":20,"max_text_length":100,"rec_batch":8,"drop_score":0.5,
+#  "cpu_threads":8,"max_image_kb":5120}
 ```
 
-`/root/.cache/openocr` 是 OpenOCR 的模型缓存目录（约 1GB，首次启动自动下载）。挂载出来可复用，
-容器重建不用重新下载；GPU 模式下这份挂载是必需的（模型只加载一次）。
-
-启动约需 1~2 分钟加载模型，就绪后：
+发布用 `deploy-openocr.sh`（本地构建镜像 → save 上传 → 服务器 load，脚本内建「镜像存在 + 权重存在」两道检查）：
 
 ```bash
-curl -s http://127.0.0.1:8089/health
-# {"status":"ok","models":["opendoc-0.1b","unirec-0.1b"],"loaded":[...],"gpu":false,"max_pixel_side":1024,"max_image_kb":5120}
+bash deploy-openocr.sh --gpu --rec-batch 4 --cpuset 0-7
 ```
 
 ### 2. 裸机
 
 ```bash
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python server.py            # 监听 0.0.0.0:8089
+# torch 要装对变体（PyPI 默认装到的是 CUDA 版，CPU 机器上白装 2GB+）：
+#   CPU:          pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   GPU(GTX10系): pip install torch --index-url https://download.pytorch.org/whl/cu126
+uvicorn server:app --host 0.0.0.0 --port 8089
 ```
 
-GPU 环境请把 `requirements.txt` 里的 `onnxruntime` 换成 `onnxruntime-gpu`（Dockerfile 已处理）。
+国内网络取 torch CPU 轮子：`pip install "torch==2.14.1+cpu" --find-links https://mirrors.aliyun.com/pytorch-wheels/cpu/`。
 
 ## 接口
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/v1/chat/completions` | OCR 推理（OpenAI Chat Completions 兼容，支持 `stream`） |
-| GET | `/v1/models` | 模型列表 |
-| GET | `/health` | 健康检查（含已加载模型、GPU 开关、缩放上限） |
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | 就绪探针，返回引擎配置（模型加载完才 `ok`） |
+| `GET /v1/models` | 只列规范 id：`scriptmoe` |
+| `POST /v1/chat/completions` | OCR 主接口，支持 `stream`、多图、base64 与远端 URL |
 
 ### 模型
 
-| 模型名 | 能力 | 输入建议 |
-|---|---|---|
-| `opendoc-0.1b` | 整页文档解析 → Markdown（含版面检测、阅读顺序、表格） | A4 整页、截图、票据整页 |
-| `unirec-0.1b` | 单行 / 单块文字识别，支持 LaTeX 公式与表格结构 | 裁剪后的文字条、公式、表格单元 |
+`scriptmoe` 是唯一规范 id。`opendoc-0.1b` / `unirec-0.1b` / `scriptmoe-0.1b` 走别名映射，
+请求里写它们一样能出结果（响应里的 `model` 会规范化成 `scriptmoe`），网关渠道无需改动。
 
 ### 请求
 
 ```json
 {
-  "model": "opendoc-0.1b",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "任意说明文本（当前版本忽略）"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,<base64>"}},
-        {"type": "image_url", "image_url": {"url": "https://example.com/page.png"}}
-      ]
-    }
-  ],
-  "max_tokens": 2048
+  "model": "scriptmoe",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "识别"},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]
+  }],
+  "stream": false
 }
 ```
 
-- `model`：`opendoc-0.1b` 或 `unirec-0.1b`，其他值返回 404 `model_not_found`。
-- 图片：`content` 数组里放 1~N 个 `image_url`，base64 data URI 与 http(s) 链接都支持，**按顺序逐张识别**。
-- `max_tokens`：映射为 UniRec 的 `max_length`，默认 2048，自动夹到 `[1, 2048]`（传 0 或缺省都用 2048）。
-- `stream`：`true` 返回 SSE；推理是同步完成后分块下发（512 字/块），不是边推理边吐字。
-- 网关常见附加字段（`temperature` / `n` / `seed` / `user` / `response_format` …）全部接受并忽略。
-- **请求里没有图片时返回 200 + 能力说明文本**（不推理、不报 400），这是为了让网关的连通性测试通过。
+- 图片放在 `content` 数组的 `image_url` 里：base64 data URI 或 http(s) 链接都行，单请求多张。
+- `max_tokens` 接受但不参与推理控制：ScriptMoE 是**逐行定长解码**，单行上限 `SCRIPTMOE_MAX_TEXT_LENGTH` 个字符，行数由检测框决定，没有全局 token 预算可以截断。
+- 纯文本请求（无图片）返回 200 + 能力说明，供网关渠道测试用。
 
 ### 响应
 
-```json
-{
-  "id": "chatcmpl-...",
-  "object": "chat.completion",
-  "created": 1760000000,
-  "model": "opendoc-0.1b",
-  "choices": [{
-    "index": 0,
-    "message": {"role": "assistant", "content": "识别结果文本 / Markdown"},
-    "finish_reason": "stop"
-  }],
-  "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-}
+标准 `chat.completion`，`content` 是纯文本。中国营业执照实测的输出形态：
+
+```text
+名称 襄阳 xx 管理有限公司
+统一社会信用代码 91420600343516164T
+注册资本 壹仟万圆整
+类型 有限责任公司(自然人投资或控股)
+成立日期 2011年06月28日
+法定代表人 张 xx
+地址 樊人民路 1 号
 ```
 
-多图时 content 按 `### 图片 i/N: 文件名` 分段，用 `---` 分隔拼接。`usage` 固定为 0，**不要用于计费**。
+同行两个文字块（标签 + 值）拼成一行；两侧都是中文时不插空格，中英文相邻插一个空格。
+识别置信度低于 `SCRIPTMOE_DROP_SCORE` 的行直接丢弃，不进 `content`。
 
 ### 错误
 
-OpenAI 风格错误体，HTTP 码 + `error.message`：
-
-| 场景 | HTTP | type |
-|---|---|---|
-| 模型名不存在 | 404 | `model_not_found` |
-| 图片解析/下载失败 | 400 | `invalid_request_error` |
-| 推理异常 | 500 | `server_error` |
-
+| HTTP | 场景 |
+|---|---|
+| 400 | 图片解析失败（base64 坏、URL 协议不支持、下载超时/超体积） |
+| 404 | 模型 id 既不在 `MODELS` 也不在别名表 |
+| 413 | 请求体超过 `OPENOCR_MAX_BODY_MB` |
+| 500 | 推理异常（详情在服务端日志，响应只带一句摘要） |
 ## 调用示例
 
 ### curl
 
 ```bash
-b64=$(base64 -w0 page.png)
+B64=$(base64 -w0 图片.png)
 curl -s http://127.0.0.1:8089/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "{\"model\":\"opendoc-0.1b\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$b64\"}}]}]}"
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"scriptmoe\",\"messages\":[{\"role\":\"user\",\"content\":[
+        {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$B64\"}}]}]}"
 ```
+
+完整可跑的例子见 `examples/curl.sh`、`examples/openai_sdk_demo.py`。
 
 ### Python（官方 openai SDK）
 
 ```python
-import base64
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8089/v1", api_key="dummy")
-b64 = base64.b64encode(open("page.png", "rb").read()).decode()
-
+client = OpenAI(base_url="http://127.0.0.1:8089/v1", api_key="EMPTY")
 r = client.chat.completions.create(
-    model="opendoc-0.1b",
+    model="scriptmoe",
     messages=[{"role": "user", "content": [
-        {"type": "text", "text": "解析这张图"},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        {"type": "image_url", "image_url": {"url": "https://example.com/lic.jpg"}},
     ]}],
 )
 print(r.choices[0].message.content)
 ```
 
-可运行版本见 `examples/openai_sdk_demo.py`（图片路径走参数，地址走 `OCR_BASE` 环境变量）。
-
 ### Java（OkHttp / RestTemplate / Hutool 均可，就是普通 HTTP POST JSON）
 
-```java
-String body = "{\"model\":\"opendoc-0.1b\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64," + b64 + "\"}}]}]}";
-// POST http://127.0.0.1:8089/v1/chat/completions, Content-Type: application/json
-// 取 choices[0].message.content
-```
+`POST http://127.0.0.1:8089/v1/chat/completions`，`Content-Type: application/json`，
+body 结构见[请求](#请求)；`Authorization` 头随便填（服务端不校验）。
 
 ## 接入 new-api / one-api 网关
 
-1. 渠道类型选 **OpenAI**，API 基址填 `http://<host>:8089/v1`（网关自己拼 `/chat/completions`，基址必须带到 `/v1`）。
-2. 模型列表填 `opendoc-0.1b,unirec-0.1b`，测试模型填 `opendoc-0.1b`。
-3. 渠道测试发的是纯文本 → 服务端返回 **200 + 说明文本**，测试通过；图片必须放在 `content` 数组的 `image_url` 里，网关原样透传。
-4. 支持 `stream=true`，SSE 格式标准，网关流式转发正常。
-5. 渠道超时设 **>= 120s**：CPU 模式 opendoc 3 图 10~38s、unirec 3 图 15~40s（机器被其他服务挤占时更慢）。
-6. `usage` 恒为 0 → 网关计费为 0；服务端不校验 `Authorization`，渠道密钥填任意值即可。
+1. 渠道类型选 `OpenAI`，API 地址填 `http://&lt;host&gt;:8089`（不带 `/v1`）。
+2. 模型名填 `scriptmoe`（老渠道里写 `opendoc-0.1b` / `unirec-0.1b` 也照样能跑）。
+3. 渠道测试：网关发纯文本 `hi` → 本服务返回 **200 + 说明文本**，测试直接过。
+4. 流式已支持，`[DONE]` 结尾正常。
+
+`python test_newapi.py 图片.jpg` 会把纯文本 / 流式 / 别名 / 未知模型 / 附加字段 / 图片逐条打出来。
 
 ## 配置项
 
-全部通过环境变量配置，无需改代码：
+全部走环境变量，默认配置在一台普通机器上开箱可用，不需要设任何东西。
 
-| 环境变量 | 默认 | 说明 |
+| 变量 | 默认 | 说明 |
 |---|---|---|
-| `OPENOCR_USE_GPU` | `false` | `true`/`1`/`yes`/`auto` = CUDA GPU；`false` = CPU |
-| `OPENOCR_MAX_PIXEL_SIDE` | `1024` | 进模型前的最长边上限，超过就等比缩小并重编码 JPEG。**越小越省显存**，密集小字会掉精度 |
-| `OPENOCR_MAX_IMAGE_KB` | `5120` | 单图字节上限（5MB），超过重编码 JPEG 直到达标（质量下限 55） |
-| `OPENOCR_MAX_PARALLEL_BLOCKS` | CPU `4` / GPU `1` | opendoc 版面块并行识别数（共享同一 ONNX 会话）。CPU 下并行真提速，GPU 下只抬峰值显存 |
-| `OPENOCR_REPEAT_GUARD` | `true` | 重复循环早停开关，`false` 关闭（回到库的原始行为） |
-| `OPENOCR_REPEAT_NGRAM` | `8` | 重复检测的最大周期（表格行结构周期一般 ≤8） |
-| `OPENOCR_REPEAT_MIN_REPS` | `3` | 同一周期至少完整重复几遍才可能判定为循环 |
-| `OPENOCR_REPEAT_MIN_TOKENS` | `32` | **正文**：连续重复这么多 token 判定为循环 |
-| `OPENOCR_REPEAT_STRUCT_MIN_TOKENS` | `96` | **表格骨架**（`<td></td>`、`|---|`）：连续重复这么多 token 才判定，是正文阈值的 3 倍 |
-| `OPENOCR_TRIM_MIN_TIMES` | `8` | 输出层兜底：正文同一子串结尾连续这么多次则截断 |
-| `OPENOCR_TRIM_STRUCT_MIN_TIMES` | `24` | 输出层兜底：表格骨架要连续这么多次才截断 |
-| `OPENOCR_URL_TIMEOUT` | `30` | 远端图片下载超时（秒） |
-| `OPENOCR_MAX_URL_MB` | `20` | 远端图片体积上限 |
-| `OPENOCR_MAX_BODY_MB` | `64` | 请求体上限（超出返回 413） |
-| `OMP_NUM_THREADS` | `4` | CPU 推理线程数 |
-| `OPENOCR_LOG_LEVEL` | `INFO` | 服务端日志级别（INFO 会打每个请求的耗时/字数） |
-| `PORT` | `8089` | `python server.py` 的监听端口 |
-
-挂载：`-v <本地目录>:/root/.cache/openocr` = 模型缓存（约 1GB，首次自动下载，建议持久化）。
-
+| `ORT` | 8089 | 监听端口 |
+| `OPENOCR_LOG_LEVEL` | INFO | 日志级别 |
+| `OPENOCR_USE_GPU_` | false | true 走 CUDA（识别 torch 与检测 ONNX 都上 GPU） |
+| `OPENOCR_CPU_THREADS` | CPU 模式 min(8, 核数) | 同时用于 ONNX Runtime 与 torch；0 = 用各自默认 |
+| `SCRIPTMOE_WEIGHTS` | models/scriptmoe/model.safetensors | 识别权重路径 |
+| `SCRIPTMOE_DICT` | models/scriptmoe/dict.txt | 字符字典路径 |
+| `SCRIPTMOE_DET_MODEL` | 空（首次在线下载） | 检测 ONNX 路径，离线环境用 |
+| `SCRIPTMOE_DET_MODE` | mobile | 检测器规格（repvit_db mobile） |
+| `SCRIPTMOE_MAX_RATIO` | 20 | 行宽高比上限，**显存与耗时随它平方增长**，见[性能与显存](#性能与显存) |
+| `SCRIPTMOE_MAX_TEXT_LENGTH` | 100 | 单行最多几个字符（decoder 步数上限） |
+| `SCRIPTMOE_DROP_SCORE` | 0.5 | 低于该识别置信度的行直接丢 |
+| `SCRIPTMOE_REC_BATCH` | 8 | 一次进多少个裁条（同宽高比才拼得进 batch） |
+| `OPENOCR_TRIM_MIN_TIMES` | 8 | 单行结尾同一子串连续重复几次判定刷屏并截断 |
+| `OPENOCR_MAX_PIXEL_SIDE` | 0（不缩放） | 只当解码炸弹的保险丝用：识别裁条反正压到 32 高，缩放只掉精度 |
+| `OPENOCR_MAX_IMAGE_KB` | 5120 | 单图体积上限，超过重编码 JPEG |
+| `OPENOCR_URL_TIMEOUT` | 30 | 远端图片下载超时（秒） |
+| `OPENOCR_MAX_URL_MB` | 20 | 远端图片体积上限 |
+| `OPENOCR_MAX_BODY_MB` | 64 | 请求体上限（base64 膨胀 4/3） |
 ## 性能与显存
 
-CPU 模式（24 核，`max_pixel_side=1024`）实测：
+### CPU（i5-7400 4C4T，4 线程，11 张中国营业执照）
 
-| 用例 | 耗时 |
-|---|---|
-| 单图（裁剪文字条） | 0.2~0.3s |
-| 整页 A4（unirec） | ~5s/页 |
-| 整页 A4（opendoc，含版面检测） | ~3s/页 |
-| 双图请求 | 6~10s |
+| 引擎 | 平均 ms/张 | 关键字段命中（8 字段 x 11 张） | 18 位代码校验位通过 |
+|---|---|---|---|
+| **ScriptMoE（本服务，API 端到端）** | **17794** | **84/88 = 95%** | **11/11** |
+| ScriptMoE（上游 E2EOCR 进程内跑，不含 HTTP 与 base64） | 16511（det 0.24–0.65s + rec 10–25s） | 84/88 = 95% | 11/11 |
+| OpenOCR repsvtr_ch（ONNX mobile） | 3335 | 74/88 = 84% | 8/11 |
+| indra-ocr（CPU ONNX） | 1411 | 66/88 = 75% | 7/11 |
 
-请求内部**串行**（单锁），并发请求排队，客户端超时建议 ≥ 60s/页。实测排队行为（本机 CPU，单图 unirec）：
+四行数据同一台机器、同一批图、同一个检测器（repvit_db mobile），差别只在识别模型。
+关键字段 = 代码 / 名称 / 类型 / 法定代表人 / 注册资本 / 成立日期 / 住所 / 经营范围 是否抽得到；
+18 位代码校验位 = 用 GB32100 校验位规则（前 17 位按 3^i mod 31 加权）验识别出来的信用代码是不是合法编号：
+错任意一个字符校验位几乎必然过不了，且不需要人工标注，是证照场景最硬的正确性指标。
 
-| 并发 | 墙钟 | 单请求延迟 min/med/max |
-|---|---|---|
-| 1 | 0.6s | 0.61 / 0.61 / 0.61s |
-| 3 | 2.5s | 0.92 / 1.68 / 2.33s |
-| 6 | 5.5s | 0.79 / 3.78 / 5.20s |
+这两列可以用仓库里的脚本在自己的证照集上复现：
 
-吞吐基本恒定（约 1.1 张/秒），并发只增加排队延迟 —— 要提吞吐就加实例，不要改锁。
-
-GPU 显存构成（fp32，模型权重只有 933MB，稳态 3550 MiB）：
-
-| 阶段 | 显存 | 说明 |
-|---|---|---|
-| CUDA context | 336 MiB | 固定成本，与模型/输入大小无关 |
-| 加载 4 个 ONNX 会话 | 2218 MiB | 权重上卡 + ORT 加载开销（opendoc 布局+识别、unirec 编码+解码，各一套显存池） |
-| 首次推理 | 3550 MiB | fp32 激活 + cuDNN workspace + 2048 token KV cache，arena 只增不还 |
-
-大头是 UniRec encoder 的自注意力，显存随输入边长**四次方**增长 —— 所以 `OPENOCR_MAX_PIXEL_SIDE`
-是最有效的显存旋钮。GPU 空闲显存不足时服务会以 CPU 模式运行（opendoc 在显存贴边时可能静默丢内容块，
-发布后建议查 `docker logs openocr-openai 2>&1 | grep -c "Error processing block"`）。
-
-显存调优、发布流程、模型缓存目录细节见 `docs/DEPLOY.md`。
-
-## 循环输出防护
-
-自回归 OCR 模型（UniRec 是 encoder-decoder 贪心解码）有个通病：**一旦陷入重复循环就停不下来**。
-空白块、密集小字、超宽长条最容易触发，表现为输出里同一段文字/表格标签反复刷屏。
-
-库原版（`openocr/tools/infer_unirec_onnx.py` 的解码循环）对此**没有任何防护**：
-
-- 纯 `argmax` 贪心，出口只有 `next_token == eos` 一个判断；
-- 后处理只有 `_{4,}`→`___`、`\.{4,}`→`...` 两条正则，治不了 token 级循环；
-- 后果不只是输出脏：循环会一路跑满 `max_length`（默认 2048）步，单张图白烧几十秒，
-  而服务端是单锁串行，**一个循环请求能把整个服务拖死**。
-
-本项目在运行时给 `UniRecONNX.decode_step` 打补丁（不改 `site-packages`），加三道保险：
-
-1. **解码层早停**：找尾部的最小重复周期 p（1~8），同一周期连续重复 ≥3 遍、且累计 token 数过阈值，
-   就把该步 logits 的 argmax 改成 EOS，让库的循环自然 `break`。
-   实测正文死循环在第 **34** 步被切断（原本跑满 2047 步），单请求最坏耗时从分钟级回到秒级。
-2. **表格骨架单独放宽**：表格输出天然高度周期化（每行结构一样、空单元格连续重复），
-   判定前会把重复片段去掉 HTML 标签，看还剩不剩文字/数字：
-   **纯骨架**（`<td></td>`、`|---|---|`、`|  |  |`）阈值放宽到 96 token（正文 32 的 3 倍），
-   含内容的重复才按 32 token 判。
-3. **输出层兜底**：结尾被同一子串刷屏时截断加 `…`，正文阈值 8 次、表格骨架阈值 24 次。
-
-**表格场景实测**（8 行 6 列工程量清单，含空单元格合计行）：
-
-| 模型 | 耗时 | 结果 |
-|---|---|---|
-| `opendoc-0.1b` | 13.6s | 完整 `<table>`，表头/合计行/空单元格全对，防护未触发、无截断标记 |
-| `unirec-0.1b` | 15.6s | 完整 `<table>`，标题行识别成 `colspan="5"`，防护未触发、无截断标记 |
-
-判定单位是「连续重复的 token 总数」，内容变化的正常大表（每行内容不同）周期大于检测窗口，不会触发。
-
-**截断显式标记**：输出跑满 `max_tokens`（说明是被长度切断的，不是模型自然收尾）时，content 末尾追加：
-
-```
-> ⚠️ 输出达到 max_tokens=2048 上限，内容被截断。表格/长文档请把大图按行块切分后分多次请求（服务端上限 2048）。
+```bash
+python test_batch.py 图片目录 --out texts.json   # 走 API 跑一批，逐张打印耗时
+python score_batch.py texts.json [texts2.json …] # 8 关键字段命中率 + GB32100 校验位，多份并列便于横向比
 ```
 
-半张表比空结果更坑调用方，所以宁可显式报警。
+- 识别是自回归解码，耗时 ≈ 行数 x 每行最长文本，**CPU 上单张证照 15~25s 是正常水平**：
+  适合「一张图几十秒、要准不要快」的场景，要秒级响应请上 GPU。
+- 单锁串行：并发请求排队，QPS 约等于 1 / 单张耗时。
+- 图片默认不缩放（`OPENOCR_MAX_PIXEL_SIDE` 默认 0）：识别裁条会被统一压到 32 高，缩放只在进检测器前丢像素。
+  旧引擎 462 张营业执照实测关键字段命中 原图 92 / 2048px 85 / 1024px 74，同一个结论：设缩放上限只丢像素不省时间。
 
-顺带修掉一个真性能坑：原版每步都对整页 encoder 的 `cross_k/cross_v` 和每层 `past_key/value`
-无条件 `.astype(np.float32)`（dtype 本来就是 float32 也照拷），一次生成几百步就是 GB 级 memcpy；
-补丁里按 dtype 判断后直接复用，长文本解码明显变快。
+### GPU 显存预算
 
-调参：
+单图激活是 encoder 第三段全局注意力的 `(B, 8, N, N)` 开销，**随 `SCRIPTMOE_MAX_RATIO` 平方增长**
+（N = (32/4) x (32 x ratio / 4)，ratio 20 时 N=1280，单图单算子 52.4 MiB）。CPU 实测，设备无关：
 
-- 表格被误判成循环（表现为日志出现「检测到重复输出」且表格缺行）→ 调大 `OPENOCR_REPEAT_STRUCT_MIN_TOKENS`（如 160）
-- 正文循环漏判（输出很长且重复）→ 调小 `OPENOCR_REPEAT_MIN_TOKENS`（如 24）
-- 想彻底回到库的原始行为 → `OPENOCR_REPEAT_GUARD=false`
-- 补丁带签名校验：升级 `openocr-python` 后 `decode_step` 签名变了就自动跳过并打 WARNING，不会瞎打
+| ratio | 识别输入 | 单图激活 |
+|---|---|---|
+| 20 | 32 x 640 | 112 MiB |
+| 8 | 32 x 256 | 26 MiB |
 
-`/health` 会回报当前防护参数（`repeat_guard`、`repeat_min_tokens`、`repeat_struct_min_tokens`），部署后扫一眼即可确认生效。
+| rec_batch | ratio 20 激活合计 | ratio 8 激活合计 |
+|---|---|---|
+| 1 | 182 MiB | — |
+| 4 | 474 MiB | — |
+| 8 | 906 MiB | 205 MiB |
+| 16 | 1770 MiB | — |
+| 32 | 3464 MiB | 1560 MiB |
+
+总预算 = 权重 175 MiB + CUDA 上下文 250~350 MiB + 激活 + 碎片 ~15%：
+
+| 配置 | 稳态显存 | 适合 |
+|---|---|---|
+| batch 8 x ratio 20 | ≈ 1.4 GiB | 4GB 卡（1050 Ti 桌面已占 ~1GB，净 3.1GiB，够用） |
+| batch 16 x ratio 20 | ≈ 2.6 GiB | 6GB 以上 |
+| batch 32 x ratio 8 | ≈ 1.6 GiB | 窄条文字为主的场景，省一半显存 |
+
+- **GTX 10 系（Pascal / sm_61）必须装 cu126 版 torch**：PyTorch 2.8 起的 cu128/cu129 wheel 已移除 Pascal 内核，CUDA 13.0 也弃用 Pascal。
+- Pascal 没有 Tensor Core，GPU 的收益来自 batch 并行，不来自半精度。
+
+## 与 OpenDoc / UniRec 的差异
+
+本服务的前身是 OpenDoc-0.1B（整页文档 → Markdown）+ UniRec-0.1B（单块识别）。换引擎是**能力交换**，不是纯升级：
+
+**得到的**（11 张营业执照实测）：
+
+- 关键字段命中 84/88 = 95%（vs repsvtr_ch 74/88 = 84%）、18 位统一社会信用代码**校验位 11/11 全过**（旧引擎 8/11）；
+- 多语种覆盖：词表 19683 字符（拉丁 / 西里尔 / 阿拉伯 / 天城文…），旧引擎主要中英；
+- 输出里没有 LaTeX 化：旧引擎会把「每个字符一个方框」的代码行输出成 `$ 9~1~3~5~… $`，现在直接是字符。
+
+**失去的**（调用方要提前知道）：
+
+- **没有版面块、没有 HTML / Markdown 表格**：输出是纯文本行，表格不会变成 `<table>` 或 `|---|`；
+- 没有公式（词表里没有 LaTeX 命令），印章 / 图片不再有占位标记；
+- 没有整页文档的层级结构（标题块 / 段落块），调用方按行自己解析；
+- CPU 上慢一个量级（16.5s vs 3.3s）。
+
+**因此删掉的服务端代码**（都随旧引擎一起失效，删除后全仓引用计数为 0）：
+版面检测 resize 取整补丁、UniRec 解码层循环早停补丁、LaTeX / 图片标签清洗、
+表格骨架重复阈值、`MAX_TOKENS_CAP`、`MAX_PARALLEL_BLOCKS`、doc / unirec 引擎初始化与专属环境变量。
+文本层的逐行重复截断保留（`_trim_repeats`）。
+
+## 输出防护
+
+ScriptMoE 的 decoder 每行最多解 100 步，整批 EOS 就早停，**不存在旧引擎那种跑满 2048 步的烧穿**。
+剩下的故障形态是单行内容被同一子串刷屏（`////`、`159595959…`）：
+`_trim_repeats` 找行尾最小重复子串，连续重复超过 `OPENOCR_TRIM_MIN_TIMES`（默认 8）次就截成 `…`。
+截断是**逐行**做的，20 行内容完全相同的正常表不会被砍 —— 用例见 `test_engine.py`。
 
 ## 自检脚本
 
 ```bash
-export OCR_BASE=http://127.0.0.1:8089/v1     # Windows: $env:OCR_BASE="..."; 默认本机
-
-python test_api.py page.png                 # 两个模型 × 单图/多图，打印耗时与识别结果
-python test_newapi.py page.png              # 网关接入自检 8 项：纯文本/流式/数组text/未知模型/附加字段/图片×3
+python test_engine.py                      # 纯 Python 单测，秒级，不加载模型
+python test_api.py 图片.jpg [图片2.jpg …]    # 规范 id + 旧 id × 单图 / 多图，打印耗时与结果
+python test_newapi.py 图片.jpg              # 模拟网关渠道测试：纯文本 / 流式 / 别名 / 附加字段 / 图片
+python test_batch.py 图片目录 --out t.json  # 批量跑一批图，逐张耗时，产出给打分脚本用
+python score_batch.py t.json               # 关键字段命中率 + GB32100 校验位打分
 ```
 
-`test_newapi.py` 8 项全部 HTTP 200（流式项要求 `[DONE]OK`）即接入正常。
-
-```bash
-python test_repeat_guard.py             # 重复循环防护的单元测试，纯 Python、不需要模型、秒级
-```
-
-覆盖 8 组用例，重点是表格场景：
-
-- 纯表格骨架 / 正文判定：`<td></td>`、`|---|---|` 判骨架；`<td>金额</td>`、`|合计|100|` 判正文
-- 正文循环在阈值处触发、阈值前一个周期不触发
-- **连续 95 个空单元格不误伤**；内容变化的 60 行大表不误伤；纯分隔行骨架不误伤；骨架空转 96 token 才切断
-- 输出层截断：正文 8 次截断、表格骨架 24 次才截
-- 模拟解码循环：正文循环第 34 步切断、空表骨架放行到 89 步、正常输出跑满 199 步不被误伤
-- 截断标记：跑满预算加标记、自然收尾不加
+`test_engine.py` 覆盖：阅读顺序组装（行聚组 / 行内排序 / 中英文分隔符）、逐行截断阈值、
+检测框排序、模型 id 别名、前置缩放与 EXIF 转正，以及**预处理与 torchvision 的逐像素一致性**
+—— 本项目刻意不装 torchvision（识别侧只要 torch），这条用例就是那个换法的验收线，
+没装 torchvision 的环境（生产容器）自动跳过。
 
 ## 项目结构
 
-```
-.
-├── server.py                  # FastAPI 服务（全部逻辑，约 300 行）
-├── requirements.txt
-├── Dockerfile                 # python:3.10-slim + onnxruntime-gpu
-├── deploy-openocr.sh          # 服务器端容器发布脚本（重建 + 健康检查轮询）
-├── test_api.py                # 接口冒烟测试
-├── test_newapi.py             # 网关接入自检（8 项）
-├── test_repeat_guard.py       # 重复循环防护单元测试（不需要模型）
-├── examples/
-│   ├── openai_sdk_demo.py     # 官方 openai SDK 调用示例
-│   └── curl.sh                # curl 调用示例
-├── docs/
-│   └── DEPLOY.md              # 显存调优 / 发布流程 / 模型缓存细节
-├── LICENSE                    # MIT（本项目）
-└── NOTICE
+```text
+server.py              FastAPI 服务：OpenAI 兼容层 + 引擎装配 + 资源上限
+ocr_engine/
+  pipeline.py          检测 + 识别 + 阅读顺序组装（服务端适配层）
+  modeling.py          ScriptMoE 网络结构（上游 vendor，勿改）
+  postprocess.py       自回归解码后处理（上游 vendor，勿改）
+  crops.py             文字框仿射裁条
+models/scriptmoe/      权重，不进 git：model.safetensors + dict.txt
+deploy-openocr.sh      发布脚本（镜像检查 / 权重检查 / 健康检查）
+examples/              curl 与 openai SDK 示例
+test_engine.py         引擎与输出层单测
+test_api.py            接口冒烟
+test_newapi.py         网关接入自检
+test_batch.py          批量跑图（耗时统计）
+score_batch.py         关键字段 + 校验位打分
 ```
 
 ## 限制与注意事项
 
-- **仅图片输入**：PDF 需调用方先转图，每页一图放进同一请求即可。
-- **无对话语义**：`text` part 会被忽略，没有 system prompt 概念，不做多轮上下文。
-- **无鉴权**：服务不校验 `Authorization`，仅供内网使用；公网暴露请自行加网关 / token / IP 白名单。
-- **无 function calling / tools / 多轮对话语义**，`usage` 恒为 0。
-- 模型权重（OpenDoc-0.1B / UniRec-0.1B）有自己的许可条款，公开部署前请查看模型卡。
+- **只吃图片**：无图片请求返回的是能力说明（不是识别结果）；PDF 需要调用方先转成图片。
+- **EXIF 方向**：检测 / 识别侧用 `cv2.imread` 读图，**不看 EXIF**。服务端在 `_shrink` 里按 EXIF 统一转正，
+  自己接图片流时要做同样的事，否则手机拍的证照整页识别质量直接崩。
+- **CPU 慢**：单张证照 15~25s 且串行排队，容量规划请当并发 1 来算。
+- **检测决定上限**：检测丢框的行永远识别不出来；`drop_score` 调低会带进噪声行
+  （实测有竖排单字被拆碎、水印串刷屏这类噪声，逐行截断能压掉一部分，压不掉的在输出里）。
+- **图片体积上限是尽力而为**：不可压缩内容（纯噪声、密集小字截图）在最低质量 55 下仍可能超过
+  `OPENOCR_MAX_IMAGE_KB`，这时不会无限循环压下去，只做有界努力。
+- **单行 100 字上限**：`SCRIPTMOE_MAX_TEXT_LENGTH` 之外的字符会被截断（单行超长的整页标题栏需要调大它，显存随之涨）。
+- **上游权重许可**：ScriptMoE 仓库没有 LICENSE 文件，公开部署前需向上游确认权重许可（见 `NOTICE`）。
+- **首帧**：模型加载 + 预热完成后 `/health` 才 `ok`；Docker `start-period` 给了 180s。
 
 ## 许可
 
-本项目（服务封装、脚本、文档）以 **MIT** 许可发布，见 [LICENSE](LICENSE)。
-
-依赖与内含项遵循各自的许可条款，不在本项目的 MIT 许可范围内：
-
-- [OpenOCR](https://github.com/Topdu/OpenOCR)（`openocr-python`）：Apache License 2.0
-- OpenDoc-0.1B / UniRec-0.1B **模型权重**：首次运行自动下载，遵循模型卡上的许可条款，
-  公开部署前请自行核对
-- ONNX Runtime、FastAPI、PyTorch 等第三方依赖：见各自上游许可
-
-归属说明见 [NOTICE](NOTICE)。
+- 本项目（OpenAI 兼容封装、脚本与文档）：MIT，见 `LICENSE`。
+- `ocr_engine/modeling.py`、`ocr_engine/postprocess.py`：ScriptMoE 上游原样 vendor，见 `NOTICE`。
+- 运行时依赖 OpenOCR / openocr-python（Apache-2.0）、PyTorch、ONNX Runtime 等，各自按上游许可。
+- 模型权重不在本仓库内分发，按其自身条款使用。

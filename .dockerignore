@@ -10,6 +10,7 @@ models/
 *.jpeg
 *.pdf
 *.onnx
+*.safetensors
 *.tar
 .git/
 .gitignore

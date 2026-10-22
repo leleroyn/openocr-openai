@@ -4,14 +4,20 @@ Copyright (c) 2026 Yong.Luo
 This project (the OpenAI-compatible service wrapper, scripts and docs) is
 licensed under the MIT License; see LICENSE.
 
+Vendored in-repo (ocr_engine/modeling.py, ocr_engine/postprocess.py):
+  - ScriptMoE E2EOCR recogniser (https://github.com/YesianRohn/ScriptMoE)
+    verbatim copies of E2EOCR/modeling.py and E2EOCR/postprocess.py.
+    The upstream repository does not declare a licence in a LICENSE file;
+    check the paper page / upstream author before any public deployment.
+
 This project is NOT the license scope of the following third-party work,
 which it depends on at runtime:
 
   - OpenOCR / openocr-python (https://github.com/Topdu/OpenOCR)
     Apache License 2.0
-  - Model weights downloaded on first run, subject to their own terms:
-      OpenDoc-0.1B (opendoc-0.1b)
-      UniRec-0.1B  (unirec-0.1b)
-    Check the model cards on ModelScope / Hugging Face before public deployment.
-  - ONNX Runtime, FastAPI, uvicorn, Pillow, PyTorch and other transitive
+  - Model weights, not shipped in this repository, subject to their own terms:
+      ScriptMoE recogniser weights (model.safetensors, ~191MB) + assets/dict.txt
+      OpenOCR repvit_db text detector ONNX (downloaded on first run)
+    Check the model cards / upstream repos before public deployment.
+  - ONNX Runtime, PyTorch, FastAPI, uvicorn, Pillow and other transitive
     dependencies: see their upstream licenses.

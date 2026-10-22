@@ -17,6 +17,7 @@ logs/
 tmp/
 models/
 *.onnx
+*.safetensors
 
 # 测试用图片（本地样例，不入库）
 /*.png
