@@ -47,7 +47,7 @@
 - **网关友好**：纯文本请求（网关的渠道连通性测试）返回 **200 + 能力说明文本**，不返回 400，渠道测试直接通过。
 - **单请求多图**：多图按顺序逐张识别，结果按 `### 图片 i/N` 分段拼接。
 - **阅读顺序组装**：同一行上的「标签 + 值」拼成一行，行内按 x 排序，两侧都是中文时不插空格、中英文相邻插一个空格 —— 证照/表单按行抽字段最省事。
-- **旧模型 id 兼容**：`opendoc-0.1b`、`unirec-0.1b` 作为别名映射到 `scriptmoe`，new-api 上已配好的渠道不用改；`/v1/models` 只列规范 id。
+- **只有一个模型 id**：`scriptmoe`。`opendoc-0.1b` / `unirec-0.1b` 连同名别名一起删掉了（引擎已不存在，留着别名只会让渠道把请求喂给不存在的能力）；new-api 渠道的模型名要改成 `scriptmoe`。
 - **GPU / CPU 一键切换**：`OPENOCR_USE_GPU=true` 走 CUDA，一条命令回退 CPU。
 - **逐行重复截断**：ScriptMoE 是定长 100 步解码，一行被同一子串刷屏（`////`、`159595959…`）时截断，正常重复行（整表同内容的行）不受影响。
 - **资源上限齐全**：请求体、远端图片体积与超时、识别 batch、行宽高比全部可配，不会被一个大请求拖死。
@@ -110,7 +110,7 @@ uvicorn server:app --host 0.0.0.0 --port 8089
 
 ### 模型
 
-`scriptmoe` 是唯一规范 id。`opendoc-0.1b` / `unirec-0.1b` / `scriptmoe-0.1b` 走别名映射，
+`scriptmoe` 是唯一模型 id，请求里的 `model` 必须精确等于它。
 请求里写它们一样能出结果（响应里的 `model` 会规范化成 `scriptmoe`），网关渠道无需改动。
 
 ### 请求
@@ -155,7 +155,7 @@ uvicorn server:app --host 0.0.0.0 --port 8089
 | HTTP | 场景 |
 |---|---|
 | 400 | 图片解析失败（base64 坏、URL 协议不支持、下载超时/超体积） |
-| 404 | 模型 id 既不在 `MODELS` 也不在别名表 |
+| 404 | 模型 id 不等于 `scriptmoe`（旧 id `opendoc-0.1b` / `unirec-0.1b` 已删，不再有别名） |
 | 413 | 请求体超过 `OPENOCR_MAX_BODY_MB` |
 | 500 | 推理异常（详情在服务端日志，响应只带一句摘要） |
 ## 调用示例
@@ -195,11 +195,11 @@ body 结构见[请求](#请求)；`Authorization` 头随便填（服务端不校
 ## 接入 new-api / one-api 网关
 
 1. 渠道类型选 `OpenAI`，API 地址填 `http://&lt;host&gt;:8089`（不带 `/v1`）。
-2. 模型名填 `scriptmoe`（老渠道里写 `opendoc-0.1b` / `unirec-0.1b` 也照样能跑）。
+2. 模型名填 `scriptmoe`（老渠道里原来的 `opendoc-0.1b` / `unirec-0.1b` 必须改掉，现在会 404）。
 3. 渠道测试：网关发纯文本 `hi` → 本服务返回 **200 + 说明文本**，测试直接过。
 4. 流式已支持，`[DONE]` 结尾正常。
 
-`python test_newapi.py 图片.jpg` 会把纯文本 / 流式 / 别名 / 未知模型 / 附加字段 / 图片逐条打出来。
+`python test_newapi.py 图片.jpg` 会把纯文本 / 流式 / 旧 id 应 404 / 未知模型 / 附加字段 / 图片逐条打出来。
 
 ## 配置项
 
@@ -316,14 +316,14 @@ ScriptMoE 的 decoder 每行最多解 100 步，整批 EOS 就早停，**不存�
 
 ```bash
 python test_engine.py                      # 纯 Python 单测，秒级，不加载模型
-python test_api.py 图片.jpg [图片2.jpg …]    # 规范 id + 旧 id × 单图 / 多图，打印耗时与结果
-python test_newapi.py 图片.jpg              # 模拟网关渠道测试：纯文本 / 流式 / 别名 / 附加字段 / 图片
+python test_api.py 图片.jpg [图片2.jpg …]    # scriptmoe × 单图 / 多图，打印耗时与结果
+python test_newapi.py 图片.jpg              # 模拟网关渠道测试：纯文本 / 流式 / 旧 id 404 / 附加字段 / 图片
 python test_batch.py 图片目录 --out t.json  # 批量跑一批图，逐张耗时，产出给打分脚本用
 python score_batch.py t.json               # 关键字段命中率 + GB32100 校验位打分
 ```
 
 `test_engine.py` 覆盖：阅读顺序组装（行聚组 / 行内排序 / 中英文分隔符）、逐行截断阈值、
-检测框排序、模型 id 别名、前置缩放与 EXIF 转正，以及**预处理与 torchvision 的逐像素一致性**
+检测框排序、模型 id 精确匹配（旧 id 不在列表且无别名对象）、前置缩放与 EXIF 转正，以及**预处理与 torchvision 的逐像素一致性**
 —— 本项目刻意不装 torchvision（识别侧只要 torch），这条用例就是那个换法的验收线，
 没装 torchvision 的环境（生产容器）自动跳过。
 

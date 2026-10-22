@@ -14,7 +14,7 @@
 ```
 /data/ocr/openocr-openai/
 ├── server.py                     # 源码留档（镜像内含，服务器上无需构建）
-├── test_api.py                   # 接口冒烟（规范 id + 旧 id 别名）
+├── test_api.py                   # 接口冒烟（scriptmoe × 单图 / 多图）
 ├── test_newapi.py                # 网关接入自检（9 项）
 └── models/                       # 挂到容器 /app/models
     ├── scriptmoe/
@@ -120,7 +120,7 @@ docker load -i openocr-openai-2.0.tar
 |---|---|
 | 渠道测试报 `400 请求中没有图片` | 网关连通性测试只发纯文本。服务端对无图片请求返回 **200 + 能力说明文本**（不推理），收到即代表连通正常 |
 | 图片请求 400 | 图片必须放在 `content` 数组的 `image_url` 里（字符串 `content` 不带图片）；base64 与 http(s) URL 两种都支持 |
-| 换模型 id 后渠道全 404 | 规范 id 是 `scriptmoe`；旧 id `opendoc-0.1b` / `unirec-0.1b` / `scriptmoe-0.1b` 作为别名照样 200，网关侧**不需要改**。`/v1/models` 只列规范 id |
+| 渠道全 404 `模型不存在` | 模型 id 只有 `scriptmoe`，且**没有别名**：旧 id `opendoc-0.1b` / `unirec-0.1b` 已随旧引擎删除，网关渠道的模型名必须改成 `scriptmoe`（`/v1/models` 可查可用列表） |
 | 期望 GPU 但 `/health` 的 `device` 是 `cpu` | torch 没拿到 GPU：查 `nvidia-smi -L`、`--gpus all`、torch 是否为 cu126（Pascal） |
 | 流式无输出 | 确认 `stream=true`，SSE 结尾必须有 `data: [DONE]`；推理同步完成后分块下发 |
 | 网关超时 | 渠道超时设 >= 120s（CPU 模式单图 15~25s，多图叠加，机器被挤占时更慢） |
@@ -135,8 +135,8 @@ docker load -i openocr-openai-2.0.tar
 
 ```bash
 python3 test_engine.py                 # 引擎层 12 项：聚行 / 排序 / 分隔符 / 截断阈值 / 权重 / 预处理一致性
-python3 test_api.py <图> <图2>         # 接口层：规范 id + 旧 id 别名 x 单图 / 多图，打印耗时
-python3 test_newapi.py <图>            # 网关层 9 项：纯文本 / 流式 / 别名 / 未知模型 / 附加字段 / 图片；全 200（流式 [DONE]OK）即接入正常
+python3 test_api.py <图> <图2>         # 接口层：scriptmoe x 单图 / 多图，打印耗时
+python3 test_newapi.py <图>            # 网关层 9 项：纯文本 / 流式 / 旧 id 应 404 / 未知模型 / 附加字段 / 图片；除旧 id 项外全 200（流式 [DONE]OK）即接入正常
 ```
 
 `test_engine.py` 的预处理一致性项是**回归护栏**：它把服务端 PIL 预处理与上游 torchvision 逐像素比对，偏差必须为 0。
@@ -146,7 +146,7 @@ python3 test_newapi.py <图>            # 网关层 9 项：纯文本 / 流式 /
 
 - **2.0（本仓库）**：识别引擎换成 ScriptMoE（多语种 0.1B，自研 vendor 的 `ocr_engine/`，不依赖 torchvision），
   OpenDoc-0.1B / UniRec-0.1B 及全部专属补丁（版面 resize 取整、解码层循环早停、表格骨架单独阈值、LaTeX 清洗、
-  `MAX_TOKENS_CAP`、`MAX_PARALLEL_BLOCKS`）随之删除，全仓引用计数为 0。模型 id 统一为 `scriptmoe`（旧 id 留别名）。
+  `MAX_TOKENS_CAP`、`MAX_PARALLEL_BLOCKS`）随之删除，全仓引用计数为 0。模型 id 只有 `scriptmoe`，旧 id 连别名一起删（网关渠道模型名需改）。
   显存旋钮从 `OPENOCR_MAX_PIXEL_SIDE` 改为 `SCRIPTMOE_MAX_RATIO` x `SCRIPTMOE_REC_BATCH`。
 - **1.8**：网关兼容修复 —— 无图片请求返回 200 说明文本（之前 400 会让渠道测试失败）；标准 SSE 流式；`max_tokens` 夹到 `[1, 2048]`。
 - **1.2**：解码层补丁、截断显式标记、远端下载超时与体积上限、请求体上限、Windows 下 stdout 强制 UTF-8（openocr 日志带 emoji，GBK 环境会 `UnicodeEncodeError` 直接退出）。

@@ -61,11 +61,10 @@ _orig_session = _ort.InferenceSession
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 对外只暴露一个模型 id。旧 id 作为 alias 收进来：new-api 上已配好的渠道不用改，
-# 但 /v1/models 只列规范 id，避免网关下拉列表里出现三个一样的引擎。
+# 只有一个模型 id，请求里的 model 必须精确等于它。OpenDoc / UniRec 引擎已删除，
+# 旧 id 连别名一起删净：要让渠道跑起来就改模型名，不靠别名把一个已经不存在的能力喂给调用方。
 MODEL = "scriptmoe"
 MODELS = [MODEL]
-MODEL_ALIASES = {"opendoc-0.1b": MODEL, "unirec-0.1b": MODEL, "scriptmoe-0.1b": MODEL}
 
 # ---- ScriptMoE 引擎配置 ------------------------------------------------------
 # 权重不进 git（191MB safetensors），从上游仓库取：
@@ -437,10 +436,10 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    model = MODEL_ALIASES.get(req.model, req.model)
-    if model not in MODELS:
+    if req.model not in MODELS:
         return _err(404, "模型不存在: " + str(req.model) + "，可用: " + str(MODELS),
                     "model_not_found")
+    model = req.model
     try:
         images = _extract_images(req.messages)
     except Exception as e:

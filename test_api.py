@@ -1,4 +1,4 @@
-"""接口冒烟测试：规范 id 与旧 id 别名 × 单图/多图，打印 HTTP 码、耗时与识别结果。
+"""接口冒烟测试：模型 scriptmoe × 单图/多图，打印 HTTP 码、耗时与识别结果。
 
 用法: python test_api.py <图片路径> [图片路径...]
 环境变量: OCR_BASE（默认 http://127.0.0.1:8089/v1）
@@ -11,7 +11,7 @@ import time
 import requests
 
 BASE = os.environ.get("OCR_BASE", "http://127.0.0.1:8089/v1")
-MODELS = ("scriptmoe", "opendoc-0.1b")   # 第二个是旧 id，验证 alias 不破渠道
+MODELS = ("scriptmoe",)   # 只有一个引擎，模型名必须精确匹配（旧 id 已删）
 
 
 def img_part(path: str) -> dict:

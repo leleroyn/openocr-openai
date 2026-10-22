@@ -22,8 +22,8 @@
 #   3) 检测权重（repvit_db ONNX，12MB）首次启动由 openocr 走 modelscope 下载，缓存在
 #      --model-dir（挂到容器 /root/.cache/openocr）。服务器不通外网时，把
 #      openocr_det_model.onnx 放进 --weights-dir 再用 --det-model 指过去。
-#   4) 接口: /v1/chat/completions  /v1/models  /health，模型 scriptmoe
-#      （旧 id opendoc-0.1b / unirec-0.1b 作为别名照样能用，网关渠道不用改）。
+#   4) 接口: /v1/chat/completions  /v1/models  /health，模型只有 scriptmoe
+#      （旧 id opendoc-0.1b / unirec-0.1b 连别名一起删了，网关渠道的模型名必须改成 scriptmoe，否则 404）。
 #   5) 显存大头是识别 encoder 第三段的全局注意力，随 SCRIPTMOE_MAX_RATIO 平方增长：
 #      权重 175MB + CUDA 上下文 250~350MB + 激活（batch8 x ratio20 ≈ 1.4GiB）+ 碎片 ~15%。
 #      4GB 卡（1050 Ti，桌面已占 ~1GB）用 --rec-batch 8 --max-ratio 20 起得来，

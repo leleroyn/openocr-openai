@@ -103,14 +103,16 @@ def test_sort_boxes_reading_order():
     print("  检测框排序: 行序 + 行内左到右，分数同步跟随")
 
 
-def test_model_id_aliases():
-    """旧渠道的模型名必须还能用，但 /v1/models 只列规范 id。"""
+def test_model_id_exact():
+    """只有一个模型 id，MODEL_ALIASES 这个对象本身都不能存在：别名留着，渠道就会把请求喂给已经删掉的能力。"""
+    assert server.MODEL == "scriptmoe"
     assert server.MODELS == [server.MODEL]
+    assert not hasattr(server, "MODEL_ALIASES"), "MODEL_ALIASES 应随旧引擎一起删除"
     for legacy in ("opendoc-0.1b", "unirec-0.1b", "scriptmoe-0.1b"):
-        assert server.MODEL_ALIASES.get(legacy) == server.MODEL, legacy
+        assert legacy not in server.MODELS, legacy
     ids = [m["id"] for m in server.list_models()["data"]]
     assert ids == [server.MODEL], ids
-    print(f"  模型 id: 规范 {server.MODEL}，旧 id 走别名映射")
+    print(f"  模型 id: 只有 {server.MODEL}，旧 id 不在列表里（请求会 404）")
 
 
 def test_preprocess_matches_torchvision():
@@ -204,7 +206,7 @@ if __name__ == "__main__":
     test_legit_repeated_rows_survive()
     test_trim_line_loop()
     test_sort_boxes_reading_order()
-    test_model_id_aliases()
+    test_model_id_exact()
     test_weights_present()
     test_shrink_and_exif()
     test_preprocess_matches_torchvision()

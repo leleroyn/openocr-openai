@@ -11,7 +11,7 @@ import sys
 from openai import OpenAI
 
 BASE = os.environ.get("OCR_BASE", "http://127.0.0.1:8089/v1")
-MODEL = os.environ.get("OCR_MODEL", "scriptmoe")   # 旧 id opendoc-0.1b / unirec-0.1b 走别名照样能用
+MODEL = os.environ.get("OCR_MODEL", "scriptmoe")   # 只有这一个模型 id
 
 
 def img_part(path: str) -> dict:
